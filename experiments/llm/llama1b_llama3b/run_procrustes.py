@@ -9,8 +9,8 @@ from alignment.similarity import (
 )
 
 
-LLAMA1B_DIR = Path("results/llama1b")
-LLAMA3B_DIR = Path("results/llama3b")
+LLAMA1B_DIR = Path("results/hidden_states/llama1b")
+LLAMA3B_DIR = Path("results/hidden_states/llama3b")
 
 OUTPUT_DIR = Path("results/llama1b_llama3b")
 

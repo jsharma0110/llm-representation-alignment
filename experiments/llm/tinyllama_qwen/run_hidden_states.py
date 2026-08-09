@@ -6,11 +6,11 @@ from alignment.models import load_causal_lm
 MODELS = {
     "tinyllama": {
         "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        "output_dir": "results/tinyllama",
+        "output_dir": "results/hidden_states/tinyllama",
     },
     "qwen": {
         "name": "Qwen/Qwen2.5-0.5B-Instruct",
-        "output_dir": "results/qwen",
+        "output_dir": "results/hidden_states/qwen",
     },
 }
 

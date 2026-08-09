@@ -5,8 +5,8 @@ import numpy as np
 from alignment.similarity import compute_cka_matrix
 
 
-TINYLLAMA_DIR = Path("results/tinyllama")
-QWEN_DIR = Path("results/qwen")
+TINYLLAMA_DIR = Path("results/hidden_states/tinyllama")
+QWEN_DIR = Path("results/hidden_states/qwen")
 
 OUTPUT_DIR = Path("results/tinyllama_qwen")
 

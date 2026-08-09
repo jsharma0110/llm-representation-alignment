@@ -6,11 +6,11 @@ from alignment.models import load_causal_lm
 MODELS = {
     "llama1b": {
         "name": "meta-llama/Llama-3.2-1B-Instruct",
-        "output_dir": "results/llama1b",
+        "output_dir": "results/hidden_states/llama1b",
     },
     "llama3b": {
         "name": "meta-llama/Llama-3.2-3B-Instruct",
-        "output_dir": "results/llama3b",
+        "output_dir": "results/hidden_states/llama3b",
     },
 }
 
