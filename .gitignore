@@ -31,3 +31,18 @@ __pycache__/
 .vscode/
 .DS_Store
 EOF
+
+cat >> .gitignore <<'EOF'
+
+# Python packaging
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Local environments
+venv/
+.venv/
+
+# macOS
+.DS_Store
+EOF
