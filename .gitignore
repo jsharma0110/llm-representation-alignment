@@ -46,3 +46,17 @@ venv/
 # macOS
 .DS_Store
 EOF
+
+cat >> .gitignore <<'EOF'
+
+# Generated experiment outputs
+results/**
+!results/**/.gitkeep
+
+# Generated figures
+figures/**/*.png
+figures/**/*.pdf
+figures/**/*.html
+figures/**/*.pickle
+figures/**/*.fig.pickle
+EOF
