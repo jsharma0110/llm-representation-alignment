@@ -1,33 +1,58 @@
-venv/
+# -----------------------------
+# Python
+# -----------------------------
+
 __pycache__/
-*.pyc
-.DS_Store
+*.py[cod]
+*.egg-info/
+.pytest_cache/
 
-cat >> .gitignore <<'EOF'
+# -----------------------------
+# Virtual environments
+# -----------------------------
 
-# Python environments
+venv/
 .venv/
 env/
 
-# Generated model representations and outputs
+# -----------------------------
+# IDE / OS files
+# -----------------------------
+
+.vscode/
+.DS_Store
+
+# -----------------------------
+# Local caches
+# -----------------------------
+
+.cache/
+huggingface/
+
+# -----------------------------
+# Generated experiment outputs
+# -----------------------------
+
+results/**
+!results/**/
+!results/**/.gitkeep
+
+# -----------------------------
+# Generated figures
+# -----------------------------
+
+figures/**/*.png
+figures/**/*.pdf
+figures/**/*.html
+figures/**/*.pickle
+figures/**/*.fig.pickle
+
+# -----------------------------
+# Model / numerical artifacts
+# -----------------------------
+
 *.pt
 *.pth
 *.npy
 *.npz
 *.pkl
-
-# Generated figures
-*.png
-*.pdf
-*.html
-
-# Local caches
-.cache/
-huggingface/
-__pycache__/
-.pytest_cache/
-
-# IDE and operating system files
-.vscode/
-.DS_Store
-EOF
