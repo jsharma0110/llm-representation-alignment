@@ -42,7 +42,7 @@ from common.decoding import (
 )
 from common.model_utils import LM, build_prompt_ids
 from stitching_large_to_small.adapter import TorchAdapter
-from stitching_large_to_small.config import PRESERVE_PREFIX
+from stitching_large_to_small.config import INJECTION_MODE, PRESERVE_PREFIX
 
 
 class LargeToSmallRunner:
@@ -66,7 +66,8 @@ class LargeToSmallRunner:
     MODES = ("exit", "warm")
 
     def __init__(self, lm_small: LM, lm_large: LM, adapter: TorchAdapter,
-                 preserve_prefix: int = PRESERVE_PREFIX, mode: str = "exit"):
+                 preserve_prefix: int = PRESERVE_PREFIX, mode: str = "exit",
+                 injection_mode: str | None = None):
         if mode not in self.MODES:
             raise SystemExit(f"mode must be one of {self.MODES}")
         self.small, self.large = Stack(lm_small), Stack(lm_large)
@@ -74,7 +75,12 @@ class LargeToSmallRunner:
         self.i, self.j = adapter.i, adapter.j
         self.preserve_prefix = preserve_prefix
         self.mode = mode
-        self.label = f"stitch-{mode}-largeL{self.j}->smallL{self.i}"
+        # Read off the adapter's own sidecar by default, so a bench never has
+        # to be told out-of-band which formula the map it just loaded expects.
+        self.injection_mode = injection_mode or adapter.meta.get(
+            "injection_mode", INJECTION_MODE)
+        self.label = (f"stitch-{mode}-largeL{self.j}->smallL{self.i}"
+                      + ("-add" if self.injection_mode == "add" else ""))
         self.device = lm_small.device
         self.small_cache = self.large_cache = None
 
@@ -99,27 +105,56 @@ class LargeToSmallRunner:
                                self.small_cache)
             return self.small.head(h)
 
-        h = self.adapter(xl).to(self.small.dtype)
-        n = min(self.preserve_prefix, n_prompt)
-        if n > 0:   # the sink, re-derived exactly from the small model's own blocks
-            h[:, :n] = self.small.run(self.small.embed(ids[:, :n]), pos[:, :n],
-                                      0, self.i, cache=None)
+        if self.injection_mode == "add":
+            # `add` needs the small model's own reading of the whole prompt to
+            # correct, not just of the preserved sink — so blocks 0..i-1 run
+            # over every prompt position here (populating `small_cache` for
+            # those layers too, which `step` extends token by token). This is
+            # what removes the `warm` first-token ceiling under `exit`: the
+            # correction is now present at the last prompt position, which is
+            # the one that decides the first generated token.
+            own = self.small.run(self.small.embed(ids), pos, 0, self.i,
+                                 self.small_cache)
+            correction = self.adapter(xl).to(self.small.dtype)
+            n = min(self.preserve_prefix, n_prompt)
+            if n > 0:   # the sink stays exactly `own`, uncorrected — same
+                correction[:, :n] = 0.0   # invariant `replace` mode's splice keeps
+            h = own + correction
+        else:
+            h = self.adapter(xl).to(self.small.dtype)
+            n = min(self.preserve_prefix, n_prompt)
+            if n > 0:   # the sink, re-derived exactly from the small model's own blocks
+                h[:, :n] = self.small.run(self.small.embed(ids[:, :n]), pos[:, :n],
+                                          0, self.i, cache=None)
         h = self.small.run(h, pos, self.i, self.small.n_layers, self.small_cache)
         return self.small.head(h)
 
     def step(self, token_id: int, position: int) -> torch.Tensor:
         ids = torch.tensor([[token_id]], device=self.device)
         pos = torch.tensor([[position]], device=self.device)
-        h = self.adapter(self.large_features(ids, pos)).to(self.small.dtype)
+        xl = self.large_features(ids, pos)
+        if self.injection_mode == "add":
+            # Extends the blocks-0..i-1 cache `prefill` started (exit) or the
+            # full-stack cache `prefill` already filled (warm) by one position,
+            # exactly the way the small model's own decode would.
+            own = self.small.run(self.small.embed(ids), pos, 0, self.i,
+                                 self.small_cache)
+            h = own + self.adapter(xl).to(self.small.dtype)
+        else:
+            h = self.adapter(xl).to(self.small.dtype)
         h = self.small.run(h, pos, self.i, self.small.n_layers, self.small_cache)
         return self.small.head(h)
 
     def active_params(self) -> int:
         """Large prefix (no unembedding — its logits are never formed) + adapter
-        + small suffix, per decoded token."""
+        + small suffix, per decoded token. `add` also runs small blocks 0..i-1
+        every step to produce the residual being corrected, which `replace`
+        does not — leaving it out would understate `add`'s real cost."""
+        extra = self.small.n_params(0, self.i, head=False) if self.injection_mode == "add" else 0
         return (self.large.n_params(0, self.j, head=False)
                 + self.adapter.n_params
-                + self.small.n_params(self.i, self.small.n_layers))
+                + self.small.n_params(self.i, self.small.n_layers)
+                + extra)
 
 
 # ── direction-specific checks ─────────────────────────────────────────────────
@@ -194,10 +229,38 @@ def check_prefix_exact(lm_small: LM, ids: torch.Tensor, i: int, n: int) -> dict:
             "passed": bool((ours == hf_pre).all())}
 
 
-def run_checks(lm_small: LM, lm_large: LM, i: int, j: int,
-               probe: str = "What is the capital city of New Zealand?") -> list[dict]:
+@torch.no_grad()
+def check_zero_add_reproduces_small(lm_small: LM, lm_large: LM, i: int, j: int,
+                                    mode: str, n_tokens: int = 8,
+                                    probe: str = "What is the capital city of New Zealand?") -> dict:
+    """The `injection_mode="add"` analogue of `identity_injection`, checked end
+    to end through the runner rather than through one hand-built resume.
+
+    A zero adapter (W=0, b=0) adds nothing, so `own_i + 0` must be exactly the
+    small model's own residual at every injected position, which must decode
+    to exactly the small model's own greedy generation. This is what licenses
+    reading `injection_mode="add"` epoch 0 as "the unmodified small model" —
+    the claim the zero-map warm start in `adapter.fit` depends on.
+    """
+    from stitching_large_to_small.adapter import TorchAdapter, zero_map
+    dim_small = lm_small.model.config.hidden_size
+    dim_large = lm_large.model.config.hidden_size
+    adapter = TorchAdapter(zero_map(dim_large, dim_small),
+                           {"small_layer_i": i, "large_layer_j": j}, lm_small.device)
+    runner = LargeToSmallRunner(lm_small, lm_large, adapter, mode=mode,
+                                injection_mode="add")
     ids = build_prompt_ids(lm_small.tokenizer, probe, lm_small.device)
-    return [
+    ref = greedy(FullRunner(lm_small, "small"), ids, n_tokens, None)["token_ids"]
+    got = greedy(runner, ids, n_tokens, None)["token_ids"]
+    return {"check": "zero_add_reproduces_small", "mode": mode,
+            "ref_tokens": ref, "got_tokens": got, "passed": ref == got}
+
+
+def run_checks(lm_small: LM, lm_large: LM, i: int, j: int,
+               probe: str = "What is the capital city of New Zealand?",
+               injection_mode: str = "replace", modes: tuple[str, ...] = ()) -> list[dict]:
+    ids = build_prompt_ids(lm_small.tokenizer, probe, lm_small.device)
+    checks = [
         check_full_stack(lm_small, ids, "small"),
         check_full_stack(lm_large, ids, "large"),
         check_baseline_matches_hf(lm_small, probe, "small"),
@@ -205,3 +268,7 @@ def run_checks(lm_small: LM, lm_large: LM, i: int, j: int,
         check_offbyone_control(lm_small, ids, i),
         check_prefix_exact(lm_small, ids, i, max(1, PRESERVE_PREFIX)),
     ]
+    if injection_mode == "add":
+        checks += [check_zero_add_reproduces_small(lm_small, lm_large, i, j, m)
+                  for m in (modes or ("exit", "warm"))]
+    return checks

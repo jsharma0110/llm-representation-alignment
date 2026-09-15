@@ -1,0 +1,159 @@
+{
+  "pair": "llama",
+  "bank": "hard_factual",
+  "direction": "large->small",
+  "small_layer_i": 8,
+  "large_layer_j": 14,
+  "train_method": "distill",
+  "injection_mode": "add",
+  "llm_tail_unfrozen": true,
+  "dim_in_large": 3072,
+  "dim_out_small": 2048,
+  "depth_matched_i": 8,
+  "form": "h_i = own_i + ((X - mu_x) / sd_x) @ W + b",
+  "injection_point": "input to small decoder block 8",
+  "source_point": "input to large decoder block 14",
+  "ridge_alpha": 0.01,
+  "answer_weight": 4.0,
+  "norm_match": true,
+  "norm_gain": 1.0640627145767212,
+  "n_rows_captured": 89507,
+  "n_rows": 89507,
+  "n_answer_rows": 26851,
+  "n_prompt_rows_kept": 62656,
+  "n_prompt_rows_available": 62656,
+  "answer_weight_frac": 0.6315653298835705,
+  "prompt_row_policy": "auto",
+  "n_prompts": 911,
+  "seed": 0,
+  "capture": {
+    "n_prompts": 911,
+    "n_bank_prompts": 211,
+    "n_corpus_prompts": 700,
+    "fit_corpus": "generic",
+    "vary_templates": true,
+    "n_rows": 89507,
+    "n_answer_rows": 26851,
+    "teacher_answer_tokens": 16,
+    "corpus_answer_tokens": 48,
+    "teacher_logits": true,
+    "teacher_topk": 128
+  },
+  "in_sample": {
+    "r2": -0.010319796109733215,
+    "cosine_mean": 0.03471977636218071,
+    "rel_l2_mean": 1.0000640153884888,
+    "n_rows": 89507
+  },
+  "held_out": {
+    "all": {
+      "r2": 0.9956540553949557,
+      "cosine_mean": 0.9375960826873779,
+      "rel_l2_mean": 0.28545406460762024,
+      "n_rows": 22156
+    },
+    "answer": {
+      "r2": 0.6258266331227553,
+      "cosine_mean": 0.8507590293884277,
+      "rel_l2_mean": 0.5299033522605896,
+      "n_rows": 6382
+    },
+    "prompt": {
+      "r2": 0.9959710460141905,
+      "cosine_mean": 0.9727295637130737,
+      "rel_l2_mean": 0.18655234575271606,
+      "n_rows": 15774
+    },
+    "after_distill": {
+      "all": {
+        "r2": -0.010432854707647987,
+        "cosine_mean": 0.03405148908495903,
+        "rel_l2_mean": 1.0000972747802734,
+        "n_rows": 22156
+      },
+      "answer": {
+        "r2": -0.275490563036743,
+        "cosine_mean": 0.09277913719415665,
+        "rel_l2_mean": 0.9962975978851318,
+        "n_rows": 6382
+      }
+    },
+    "before_distill_same_rows": {
+      "all": {
+        "r2": 0.9955754839968538,
+        "cosine_mean": 0.9498180150985718,
+        "rel_l2_mean": 0.26325345039367676,
+        "n_rows": 22156
+      },
+      "answer": {
+        "r2": 0.7296475151123798,
+        "cosine_mean": 0.8913366794586182,
+        "rel_l2_mean": 0.45360109210014343,
+        "n_rows": 6382
+      }
+    },
+    "after_distill_note": "both maps were fit on these rows; compare the two to each other, not to held_out; injection_mode=add, so these R2 numbers are against the raw delta output, not against Y \u2014 not comparable to replace-mode numbers"
+  },
+  "distill_train_mode": "exit",
+  "distill_epochs": 4,
+  "distill_lr": 2e-06,
+  "distill_tail_lr": 2e-06,
+  "distill_batch_seqs": 4,
+  "distill_ce_weight": 0.1,
+  "distill_temperature": 1.0,
+  "distill_topk": 128,
+  "distill_val_frac": 0.2,
+  "distill_n_train_seqs": 729,
+  "distill_n_val_seqs": 182,
+  "distill_val_loss_ridge": 0.7101844790248344,
+  "distill_val_loss_best": 0.34595179996340647,
+  "distill_best_epoch": 4,
+  "distill_improved_on_ridge": true,
+  "distill_history": [
+    {
+      "epoch": 0,
+      "val_loss": 0.7101844790248344,
+      "train_loss": null
+    },
+    {
+      "epoch": 1,
+      "val_loss": 0.3848280183674133,
+      "train_loss": 0.4276025703567941
+    },
+    {
+      "epoch": 2,
+      "val_loss": 0.3643175821948367,
+      "train_loss": 0.3379396570755254
+    },
+    {
+      "epoch": 3,
+      "val_loss": 0.353400054829103,
+      "train_loss": 0.30155645465891584
+    },
+    {
+      "epoch": 4,
+      "val_loss": 0.34595179996340647,
+      "train_loss": 0.27389633229518323
+    }
+  ],
+  "distill_max_seqs": null,
+  "frozen_llm_evidence": {
+    "llm_params_total": 146,
+    "llm_params_trainable": 72,
+    "llm_tail_params_trained": 486572032,
+    "adapter_tensors_trained": 2,
+    "adapter_params_trained": 6293504
+  },
+  "probe_prompt_row0": 283,
+  "probe_logits_sha_head": [
+    -4.0,
+    -9.4375,
+    -7.84375,
+    -5.0625,
+    -8.3125,
+    -6.46875,
+    -7.84375,
+    -11.75
+  ],
+  "probe_logits_argmax": 128006
+}

@@ -249,6 +249,50 @@ DISTILL_TRAIN_MODE = "warm"
 #   bench reports. `warm` is the default because it is the mode the measured
 #   best cell used.
 
+INJECTION_MODES = ("replace", "add")
+INJECTION_MODE = "replace"
+# ^ How the adapter's output combines with the small model's own layer-i
+#   residual at an injected position.
+#
+#   `replace` overwrites the residual outright — the small model's own
+#   computation at that position is discarded entirely. This is the mode
+#   measured in the 2026-08-17/08-23 results and it is what makes
+#   overwrite-and-continue the binding constraint identified there: a frozen
+#   suffix has to treat a projected 3072->2048 vector as if it were its own
+#   native state, with no fallback to what it would have computed itself.
+#
+#   `add` keeps the small model's own residual and adds the adapter's output
+#   as a correction on top: `h = own_i + adapter(x_large)`. Only `distill` can
+#   fit this (see `adapter.fit`) — ridge's target is `Y`, the small model's own
+#   residual, so a ridge-fit delta-to-itself is trivially zero and the
+#   objective has nothing to say about what correction should be added. The
+#   distilled adapter is instead warm-started from a zero map (W=0, b=0), so
+#   epoch 0 of an `add` run is exactly the unmodified small model — a real
+#   baseline, not a discarded one — and any accuracy gain has to come from
+#   something the correction actually learned.
+#
+#   `add` under `exit` geometry also removes the `warm` first-token ceiling:
+#   because the small model's own blocks 0..i-1 now run over the whole prompt
+#   (needed to have an "own" residual to add to), the correction is available
+#   at the last prompt position too, which is the position that decides the
+#   first generated token.
+
+TAIL_LR = 2e-6
+# ^ Learning rate for the small model's suffix blocks under `--unfreeze-tail`.
+#   Same order as DISTILL_LR because both are perturbing pretrained weights by
+#   gradient descent on the same objective; the tail has vastly more
+#   parameters than the adapter, so this is not a "warm start", it is real
+#   fine-tuning, kept slow enough that a handful of epochs on a few hundred
+#   sequences moves weights by a small fraction of their norm rather than
+#   overwriting what the block already knows.
+# ^ Unfreezing the small model's suffix (blocks i..end) is the last of the
+#   three changes the 2026-08-23 section names, and the most drastic: it steps
+#   outside "without fine-tuning either LLM". It exists here as an explicit,
+#   separately labelled opt-in (`fit --unfreeze-tail`) rather than a default,
+#   because it changes what the experiment is claiming, not just how the map
+#   is fit. Every artefact produced with it records `llm_tail_unfrozen: true`
+#   so it is never confused with a frozen-LLM result.
+
 # ── decoding ──────────────────────────────────────────────────────────────────
 LATENCY_PROMPTS = 4
 LATENCY_REPEATS = 2
@@ -285,52 +329,80 @@ def adapters_dir(pair: Pair, bank: Bank) -> Path:
     return results_dir(pair, bank) / "adapters"
 
 
-def variant_tag(train_method: str | None) -> str:
+def variant_tag(train_method: str | None, injection_mode: str = INJECTION_MODE,
+               unfreeze_tail: bool = False) -> str:
     """Filename suffix identifying how an adapter was fit.
 
-    Empty for `legacy` (and for `None`, which means the same thing), so the
-    artefacts of the published all-ridge failure keep the exact filenames they
-    were written under and no new run can overwrite one. Everything fit after
-    the capture was rebuilt carries its method in the name — including ridge,
-    because "ridge on the old 753-answer-row capture" and "ridge on the new one"
-    are different maps and the whole exercise is comparing them.
+    Empty for `legacy` (and for `None`, which means the same thing) when the
+    other two axes are also at their default, so the artefacts of the
+    published all-ridge failure keep the exact filenames they were written
+    under and no new run can overwrite one. Everything fit after the capture
+    was rebuilt carries its method in the name — including ridge, because
+    "ridge on the old 753-answer-row capture" and "ridge on the new one" are
+    different maps and the whole exercise is comparing them.
+
+    `injection_mode="add"` and `unfreeze_tail=True` each add their own tag
+    component so a replace/add pair and a frozen/unfrozen pair at the same
+    (i, j, train_method) never collide on disk — the whole point of comparing
+    them is having both on disk at once.
     """
-    if train_method in (None, LEGACY_TRAIN_METHOD):
-        return ""
-    if train_method not in TRAIN_METHODS:
+    if train_method not in (None, LEGACY_TRAIN_METHOD) and train_method not in TRAIN_METHODS:
         raise SystemExit(f"--train-method must be one of "
                          f"{TRAIN_METHODS + (LEGACY_TRAIN_METHOD,)}, got {train_method!r}")
-    return f"_{train_method}"
+    if injection_mode not in INJECTION_MODES:
+        raise SystemExit(f"--injection-mode must be one of {INJECTION_MODES}, "
+                         f"got {injection_mode!r}")
+    tag = "" if train_method in (None, LEGACY_TRAIN_METHOD) else f"_{train_method}"
+    if injection_mode != INJECTION_MODE:
+        tag += f"_{injection_mode}"
+    if unfreeze_tail:
+        tag += "_unfroze"
+    return tag
 
 
 def adapter_path(pair: Pair, i: int, j: int, bank: Bank,
-                 train_method: str | None = None) -> Path:
+                 train_method: str | None = None,
+                 injection_mode: str = INJECTION_MODE,
+                 unfreeze_tail: bool = False) -> Path:
     return (adapters_dir(pair, bank)
-            / f"adapter_i{i:02d}_j{j:02d}{variant_tag(train_method)}.npz")
+            / f"adapter_i{i:02d}_j{j:02d}"
+              f"{variant_tag(train_method, injection_mode, unfreeze_tail)}.npz")
 
 
 def checks_path(pair: Pair, bank: Bank, i: int, j: int,
-                train_method: str | None = None) -> Path:
+                train_method: str | None = None,
+                injection_mode: str = INJECTION_MODE,
+                unfreeze_tail: bool = False) -> Path:
     return (results_dir(pair, bank) / "checks"
-            / f"checks_i{i:02d}_j{j:02d}{variant_tag(train_method)}.json")
+            / f"checks_i{i:02d}_j{j:02d}"
+              f"{variant_tag(train_method, injection_mode, unfreeze_tail)}.json")
 
 
 def bench_path(pair: Pair, i: int, j: int, split: str, mode: str, bank: Bank,
-               train_method: str | None = None) -> Path:
+               train_method: str | None = None,
+               injection_mode: str = INJECTION_MODE,
+               unfreeze_tail: bool = False) -> Path:
     return (results_dir(pair, bank) / "benches"
-            / f"bench_i{i:02d}_j{j:02d}_{split}_{mode}{variant_tag(train_method)}.json")
+            / f"bench_i{i:02d}_j{j:02d}_{split}_{mode}"
+              f"{variant_tag(train_method, injection_mode, unfreeze_tail)}.json")
 
 
 def sweep_path(pair: Pair, bank: Bank, split: str, mode: str,
-               train_method: str | None = None) -> Path:
+               train_method: str | None = None,
+               injection_mode: str = INJECTION_MODE,
+               unfreeze_tail: bool = False) -> Path:
     return (results_dir(pair, bank) / "sweeps"
-            / f"sweep_{split}_{mode}{variant_tag(train_method)}.json")
+            / f"sweep_{split}_{mode}"
+              f"{variant_tag(train_method, injection_mode, unfreeze_tail)}.json")
 
 
 def table_path(pair: Pair, bank: Bank, split: str, mode: str,
-               train_method: str | None = None) -> Path:
+               train_method: str | None = None,
+               injection_mode: str = INJECTION_MODE,
+               unfreeze_tail: bool = False) -> Path:
     return (results_dir(pair, bank) / "tables"
-            / f"sweep_{split}_{mode}{variant_tag(train_method)}.csv")
+            / f"sweep_{split}_{mode}"
+              f"{variant_tag(train_method, injection_mode, unfreeze_tail)}.csv")
 
 
 def capture_layers(pair: Pair) -> tuple[list[int], list[int]]:

@@ -73,8 +73,8 @@ from common.model_utils import LM
 from stitching_large_to_small.config import (
     DISTILL_BATCH_SEQS, DISTILL_CE_WEIGHT, DISTILL_EPOCHS, DISTILL_LR,
     DISTILL_MAX_GRAD_NORM, DISTILL_TEMPERATURE, DISTILL_TRAIN_MODE,
-    DISTILL_TRAIN_MODES, DISTILL_VAL_FRAC, DISTILL_WEIGHT_DECAY, PRESERVE_PREFIX,
-    SEED, Bank, Pair,
+    DISTILL_TRAIN_MODES, DISTILL_VAL_FRAC, DISTILL_WEIGHT_DECAY, INJECTION_MODE,
+    INJECTION_MODES, PRESERVE_PREFIX, SEED, TAIL_LR, Bank, Pair,
 )
 
 TRAINABLE = ("W", "b")
@@ -133,6 +133,52 @@ def _assert_only_adapter_trains(models: list[LM], adapter: TrainableAdapter,
                          f"({len(got)} tensors vs {len(want)}).")
     return {"llm_params_total": len(llm_params), "llm_params_trainable": 0,
             "adapter_tensors_trained": len(want),
+            "adapter_params_trained": sum(p.numel() for p in adapter.parameters())}
+
+
+def _assert_frozen_except_tail(lm_small: LM, lm_large: LM | None, tail_params: list,
+                               adapter: TrainableAdapter,
+                               opt: torch.optim.Optimizer) -> dict:
+    """The `--unfreeze-tail` counterpart of `_assert_only_adapter_trains`.
+
+    This variant is used only when the caller explicitly opted into fine-tuning
+    the small model's suffix, which steps outside "no fine-tuning either LLM".
+    What still must hold, and is checked rather than trusted: the large model is
+    fully frozen (its only role is producing `X` and the teacher distribution,
+    both already captured), and the small model's embedding plus blocks
+    `0..i-1` are frozen too — only its suffix `i..end` (the intended tail) plus
+    the adapter may have gradients, and the optimiser must hold exactly that set
+    and nothing more.
+    """
+    if lm_large is not None:
+        n_large_unfrozen = sum(p.requires_grad for p in lm_large.model.parameters())
+        if n_large_unfrozen:
+            raise SystemExit(f"{n_large_unfrozen} large-model parameters have "
+                             f"requires_grad=True; the large model must stay frozen "
+                             f"even under --unfreeze-tail.")
+    tail_ids = {id(p) for p in tail_params}
+    head_params = [p for n, p in lm_small.model.named_parameters()
+                  if id(p) not in tail_ids]
+    n_head_unfrozen = sum(p.requires_grad for p in head_params)
+    if n_head_unfrozen:
+        raise SystemExit(f"{n_head_unfrozen} small-model parameters outside the "
+                         f"unfrozen tail have requires_grad=True; only blocks "
+                         f"i..end may move under --unfreeze-tail.")
+    n_tail_frozen = sum(not p.requires_grad for p in tail_params)
+    if n_tail_frozen:
+        raise SystemExit(f"{n_tail_frozen} intended tail parameters still have "
+                         f"requires_grad=False.")
+    want = {id(p) for p in adapter.parameters()} | tail_ids
+    got = {id(p) for g in opt.param_groups for p in g["params"]}
+    if want != got:
+        raise SystemExit(f"optimiser parameter set is not exactly adapter + tail "
+                         f"({len(got)} tensors vs {len(want)}).")
+    return {"llm_params_total": sum(1 for _ in lm_small.model.parameters())
+                             + (sum(1 for _ in lm_large.model.parameters())
+                                if lm_large is not None else 0),
+            "llm_params_trainable": len(tail_params),
+            "llm_tail_params_trained": sum(p.numel() for p in tail_params),
+            "adapter_tensors_trained": len({id(p) for p in adapter.parameters()}),
             "adapter_params_trained": sum(p.numel() for p in adapter.parameters())}
 
 
@@ -202,8 +248,11 @@ def train(pair: Pair, bank: Bank, i: int, j: int, base_map: dict, lm_small: LM,
           train_mode: str = DISTILL_TRAIN_MODE,
           preserve_prefix: int = PRESERVE_PREFIX,
           max_seqs: int | None = None,
-          verbose: bool = True) -> tuple[dict, dict]:
-    """Distil into the adapter. Returns (map arrays, training metadata).
+          injection_mode: str = INJECTION_MODE,
+          unfreeze_tail: bool = False, tail_lr: float = TAIL_LR,
+          verbose: bool = True) -> tuple[dict, dict, dict | None]:
+    """Distil into the adapter. Returns (map arrays, training metadata, tail
+    state dict or None).
 
     `lm_small` is the model the loss flows through: this direction's suffix is
     the *small* model's blocks i..end, so it is the small model that must be
@@ -211,17 +260,43 @@ def train(pair: Pair, bank: Bank, i: int, j: int, base_map: dict, lm_small: LM,
     at all — its contribution is the states in `X` and the distributions in
     `t_vals`, both captured offline — but it is asserted frozen when it happens
     to be loaded.
+
+    `injection_mode="add"` changes only which tensor the adapter's output is
+    compared against inside the training forward (see `_masks`/`seq_loss`
+    below); `base_map` must already be the zero map in that case (`adapter.fit`
+    arranges this), so epoch 0 here really is the unmodified small model.
+
+    `unfreeze_tail=True` additionally lets the small model's own blocks
+    `i..end` train alongside the adapter, at `tail_lr`, in a second optimiser
+    param group. This is the one variant here that is not "no fine-tuning
+    either LLM" — `lm_small.model` is mutated in place by this call, and the
+    caller is responsible for saving the resulting tail weights (returned as
+    the third element) since a fresh `load_lm` elsewhere would not have them.
     """
     if train_mode not in DISTILL_TRAIN_MODES:
         raise SystemExit(f"--distill-train-mode must be one of {DISTILL_TRAIN_MODES}")
+    if injection_mode not in INJECTION_MODES:
+        raise SystemExit(f"--injection-mode must be one of {INJECTION_MODES}")
     device = lm_small.device
     stack = Stack(lm_small)
     freeze(*(x for x in (lm_small, lm_large) if x is not None))
 
     adapter = TrainableAdapter(base_map, device)
-    opt = torch.optim.AdamW(adapter.parameters(), lr=lr, weight_decay=weight_decay)
-    frozen_evidence = _assert_only_adapter_trains(
-        [x for x in (lm_small, lm_large) if x is not None], adapter, opt)
+    tail_params = []
+    if unfreeze_tail:
+        for layer in stack.layers[i:]:
+            for p in layer.parameters():
+                p.requires_grad_(True)
+                tail_params.append(p)
+        opt = torch.optim.AdamW(
+            [{"params": adapter.parameters(), "lr": lr, "weight_decay": weight_decay},
+             {"params": tail_params, "lr": tail_lr, "weight_decay": weight_decay}])
+        frozen_evidence = _assert_frozen_except_tail(
+            lm_small, lm_large, tail_params, adapter, opt)
+    else:
+        opt = torch.optim.AdamW(adapter.parameters(), lr=lr, weight_decay=weight_decay)
+        frozen_evidence = _assert_only_adapter_trains(
+            [x for x in (lm_small, lm_large) if x is not None], adapter, opt)
 
     seqs = _sequences(pid, is_answer, position)
     rng = np.random.default_rng(seed + 1)
@@ -262,7 +337,16 @@ def train(pair: Pair, bank: Bank, i: int, j: int, base_map: dict, lm_small: LM,
         # states its own forward would have produced, which is what its KV cache
         # holds at those positions during inference.
         h = to(Y[idx]).to(torch.float32).unsqueeze(0).clone()
-        h[0, to(np.flatnonzero(inject)).long()] = adapter(to(X[idx][inject]).to(torch.float32))
+        inj = to(np.flatnonzero(inject)).long()
+        correction = adapter(to(X[idx][inject]).to(torch.float32))
+        if injection_mode == "add":
+            # `Y[idx][inject]` is exactly the small model's own layer-i residual
+            # at these positions (captured under teacher forcing on the correct
+            # trajectory), so it is what the correction is added to — the same
+            # role `own` plays in `LargeToSmallRunner` at inference.
+            h[0, inj] = h[0, inj] + correction
+        else:
+            h[0, inj] = correction
         pos = to(position[idx]).long().unsqueeze(0)
         out = stack.run(h.to(stack.dtype), pos, i, stack.n_layers, cache=None)
         logits = stack.lm_head(stack.base.norm(out))[0]
@@ -288,12 +372,16 @@ def train(pair: Pair, bank: Bank, i: int, j: int, base_map: dict, lm_small: LM,
     best = ridge_val = evaluate(val_seqs)
     best_ep = 0
     best_state = {k: t.detach().clone() for k, t in adapter.state_dict().items()}
+    best_tail_state = ([p.detach().clone() for p in tail_params]
+                       if unfreeze_tail else None)
     improved = False
     history = [{"epoch": 0, "val_loss": ridge_val, "train_loss": None}]
     if verbose:
-        print(f"  [distill] mode={train_mode}  {len(train_seqs)} train / "
+        print(f"  [distill] mode={train_mode} injection={injection_mode} "
+              f"unfreeze_tail={unfreeze_tail}  {len(train_seqs)} train / "
               f"{len(val_seqs)} val sequences, warm start val loss {ridge_val:.4f}")
 
+    clip_params = list(adapter.parameters()) + tail_params
     for ep in range(1, epochs + 1):
         perm = rng.permutation(len(train_seqs))
         tot, nb = 0.0, 0
@@ -304,7 +392,7 @@ def train(pair: Pair, bank: Bank, i: int, j: int, base_map: dict, lm_small: LM,
             tot += float(loss.detach()) * batch_seqs
             nb += 1
             if k % batch_seqs == 0 or k == len(perm):
-                torch.nn.utils.clip_grad_norm_(adapter.parameters(), max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(clip_params, max_grad_norm)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
             if verbose and k % 200 == 0:
@@ -318,9 +406,17 @@ def train(pair: Pair, bank: Bank, i: int, j: int, base_map: dict, lm_small: LM,
         if v < best:
             best, best_ep, improved = v, ep, True
             best_state = {k: t.detach().clone() for k, t in adapter.state_dict().items()}
+            if unfreeze_tail:
+                best_tail_state = [p.detach().clone() for p in tail_params]
 
     # Always restore, including when the winner is epoch 0.
     adapter.load_state_dict(best_state)
+    if unfreeze_tail:
+        with torch.no_grad():
+            for p, saved in zip(tail_params, best_tail_state):
+                p.copy_(saved)
+        for p in tail_params:      # leave lm_small as `freeze` found it
+            p.requires_grad_(False)
     if verbose and not improved:
         print("  [distill] no epoch beat the ridge warm start — restored the warm "
               "start, so this variant ships the ridge map exactly")
@@ -332,8 +428,9 @@ def train(pair: Pair, bank: Bank, i: int, j: int, base_map: dict, lm_small: LM,
     with torch.no_grad():
         inject, _ = _masks(probe)
         h = to(Y[probe]).to(torch.float32).unsqueeze(0).clone()
-        h[0, to(np.flatnonzero(inject)).long()] = adapter(
-            to(X[probe][inject]).to(torch.float32))
+        inj = to(np.flatnonzero(inject)).long()
+        correction = adapter(to(X[probe][inject]).to(torch.float32))
+        h[0, inj] = (h[0, inj] + correction) if injection_mode == "add" else correction
         pos = to(position[probe]).long().unsqueeze(0)
         out = stack.run(h.to(stack.dtype), pos, i, stack.n_layers, cache=None)
         probe_logits = stack.lm_head(stack.base.norm(out))[0][-1].float().cpu().numpy()
@@ -341,7 +438,10 @@ def train(pair: Pair, bank: Bank, i: int, j: int, base_map: dict, lm_small: LM,
     meta = {
         "train_method": "distill",
         "distill_train_mode": train_mode,
+        "injection_mode": injection_mode,
+        "llm_tail_unfrozen": unfreeze_tail,
         "distill_epochs": epochs, "distill_lr": lr,
+        "distill_tail_lr": tail_lr if unfreeze_tail else None,
         "distill_batch_seqs": batch_seqs, "distill_ce_weight": ce_weight,
         "distill_temperature": temperature, "distill_topk": int(t_idx.shape[1]),
         "distill_val_frac": val_frac,
@@ -356,4 +456,8 @@ def train(pair: Pair, bank: Bank, i: int, j: int, base_map: dict, lm_small: LM,
         "probe_logits_sha_head": [float(x) for x in probe_logits[:8]],
         "probe_logits_argmax": int(probe_logits.argmax()),
     }
-    return adapter.to_numpy(), meta
+    tail_state = ({f"layer_{i + k}.{name}": p.detach().cpu().clone()
+                   for k, layer in enumerate(stack.layers[i:])
+                   for name, p in layer.named_parameters()}
+                  if unfreeze_tail else None)
+    return adapter.to_numpy(), meta, tail_state

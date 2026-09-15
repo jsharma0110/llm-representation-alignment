@@ -77,7 +77,7 @@ def main() -> int:
             "b": np.zeros(D_SMALL, np.float32),
             "mu_x": X.mean(0), "sd_x": X.std(0) + 1e-6, "mu_y": Y.mean(0)}
 
-    m, meta = distill.train(
+    m, meta, _ = distill.train(
         None, None, i, j, base, lm_small, X, Y, pid, is_answer, position,
         t_vals, t_idx, lm_large=lm_large, epochs=3, lr=1e-2, batch_seqs=2,
         val_frac=0.34, verbose=False)
@@ -113,7 +113,7 @@ def main() -> int:
     #    "distill with 0 steps must score exactly what ridge scored" a statement
     #    about the file rather than about the benchmark: identical arrays decode
     #    identically, so no GPU time has to be spent proving it.
-    z, zmeta = distill.train(
+    z, zmeta, _ = distill.train(
         None, None, i, j, base, lm_small, X, Y, pid, is_answer, position,
         t_vals, t_idx, lm_large=lm_large, epochs=0, batch_seqs=2, val_frac=0.34,
         verbose=False)
@@ -160,7 +160,7 @@ def main() -> int:
     #    Driven with an absurd learning rate so training is guaranteed to make
     #    things worse. The bug this guards against returned the LAST epoch's
     #    weights while printing "shipping ridge unchanged".
-    blown, bmeta = distill.train(
+    blown, bmeta, _ = distill.train(
         None, None, i, j, base, lm_small, X, Y, pid, is_answer, position,
         t_vals, t_idx, lm_large=lm_large, epochs=2, lr=5.0, batch_seqs=2,
         val_frac=0.34, verbose=False)
@@ -171,6 +171,93 @@ def main() -> int:
             f"{k} was not restored to the warm start when no epoch improved"
     print("[ok] no-improvement run restores the ridge warm start exactly")
 
+    # 9a. injection_mode="add" with a zero base map: epoch 0 must reproduce the
+    #     small model's own residual (`Y`) exactly, since adding a zero
+    #     correction to `Y` is `Y`, and the argmax it decodes to must match the
+    #     unmodified small model's — the additive analogue of check 5 above.
+    zero_base = {"W": np.zeros((D_LARGE, D_SMALL), np.float32),
+                "b": np.zeros(D_SMALL, np.float32),
+                "mu_x": np.zeros(D_LARGE, np.float32), "sd_x": np.ones(D_LARGE, np.float32),
+                "mu_y": np.zeros(D_SMALL, np.float32)}
+    add_m, add_meta, _ = distill.train(
+        None, None, i, j, zero_base, lm_small, X, Y, pid, is_answer, position,
+        t_vals, t_idx, lm_large=lm_large, epochs=0, batch_seqs=2, val_frac=0.34,
+        injection_mode="add", verbose=False)
+    for k in ("W", "b"):
+        assert np.array_equal(add_m[k], zero_base[k]), f"0-epoch add-mode changed {k}"
+    probe = np.flatnonzero(pid == pid[add_meta["probe_prompt_row0"]])
+    probe = probe[np.argsort(position[probe], kind="stable")]
+    with torch.no_grad():
+        hh = torch.from_numpy(Y[probe]).float().unsqueeze(0)   # own residual, untouched
+        pos = torch.from_numpy(position[probe]).long().unsqueeze(0)
+        out = stack.run(hh.to(stack.dtype), pos, i, stack.n_layers, cache=None)
+        ref_argmax = int(stack.lm_head(stack.base.norm(out))[0][-1].float().argmax())
+    assert ref_argmax == add_meta["probe_logits_argmax"], \
+        "0-epoch add-mode did not reproduce the unmodified small model's argmax"
+    print("[ok] injection_mode=add, 0 epochs: adapter output is zero and the "
+          "probe reproduces the unmodified small model exactly")
+
+    # 9b. --unfreeze-tail, high-level API: must not crash, must report exactly
+    #     the intended tail parameter count as trainable, must hand back a
+    #     tail_state dict, and must leave the model's `requires_grad` flags
+    #     exactly as `freeze` found them once done (no leaked True flags).
+    #     Whether the *shipped* weights differ from the warm start is not
+    #     asserted here: on structureless i.i.d. random data, train and val
+    #     sequences share no signal, so epoch-selection-by-val-loss can
+    #     legitimately keep epoch 0 — that is the same "no improvement, ship
+    #     the start unchanged" property check 8 already covers for the adapter
+    #     alone, now extended to the tail, not a plumbing defect.
+    lm_small_tail = tiny(D_SMALL, N_SMALL, "S")
+    _, tail_meta, tail_state = distill.train(
+        None, None, i, j, dict(base), lm_small_tail, X, Y, pid, is_answer, position,
+        t_vals, t_idx, lm_large=lm_large, epochs=2, lr=1e-2, batch_seqs=2,
+        val_frac=0.34, unfreeze_tail=True, tail_lr=1e-1, verbose=False)
+    n_tail_tensors = sum(1 for layer in Stack(tiny(D_SMALL, N_SMALL, "S")).layers[i:]
+                        for _ in layer.parameters())
+    assert tail_meta["frozen_llm_evidence"]["llm_params_trainable"] == n_tail_tensors
+    assert tail_state is not None and len(tail_state) > 0
+    assert all(not p.requires_grad for layer in Stack(lm_small_tail).layers[i:]
+              for p in layer.parameters()), "tail left with requires_grad=True after training"
+    print(f"[ok] --unfreeze-tail high-level API: reports {N_SMALL - i} tail blocks "
+          f"trainable, saves a non-empty tail_state, re-freezes afterward")
+
+    # 9c. --unfreeze-tail, direct gradient-flow check: independent of
+    #     epoch-selection dynamics, a single forward/backward through the same
+    #     primitives `distill.train` uses must put a nonzero gradient on every
+    #     unfrozen-tail parameter and on NO other parameter — embeddings,
+    #     blocks 0..i-1, and the large model included. This is the actual
+    #     plumbing risk (`requires_grad` routed to the wrong tensors) that 9b's
+    #     data-dependent outcome cannot distinguish from "trained but reverted".
+    lm_grad = tiny(D_SMALL, N_SMALL, "S")
+    stack_g = Stack(lm_grad)
+    for p in lm_grad.model.parameters():
+        p.requires_grad_(False)
+    tail_params_g = [p for layer in stack_g.layers[i:] for p in layer.parameters()]
+    for p in tail_params_g:
+        p.requires_grad_(True)
+    adapter_g = distill.TrainableAdapter(dict(base), "cpu")
+    row = np.flatnonzero(pid == pid[0])
+    row = row[np.argsort(position[row], kind="stable")]
+    ans = is_answer[row] == 1
+    h = torch.from_numpy(Y[row]).float().unsqueeze(0).clone()
+    ans_idx = torch.from_numpy(np.flatnonzero(ans)).long()
+    h[0, ans_idx] = adapter_g(torch.from_numpy(X[row][ans]).float())
+    pos = torch.from_numpy(position[row]).long().unsqueeze(0)
+    out = stack_g.run(h.to(stack_g.dtype), pos, i, stack_g.n_layers, cache=None)
+    logits = stack_g.lm_head(stack_g.base.norm(out))[0]
+    sel = logits[ans_idx].float()
+    loss = distill.kl_to_teacher(sel, torch.from_numpy(t_vals[row][ans].astype(np.float32)),
+                                 torch.from_numpy(t_idx[row][ans].astype(np.int64)))
+    loss.backward()
+    assert all(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in tail_params_g), \
+        "no gradient reached the unfrozen tail"
+    other = [p for n, p in lm_grad.model.named_parameters()
+            if not n.startswith(tuple(f"model.layers.{L}." for L in range(i, N_SMALL)))]
+    assert all(p.grad is None for p in other), \
+        "gradient leaked to a parameter outside the unfrozen tail"
+    print(f"[ok] --unfreeze-tail gradient flow: reaches blocks {i}..{N_SMALL - 1} "
+          f"and no other parameter")
+
     # 9. The training forward IS the warm-mode inference forward.
     #    Load-bearing: distillation optimises whatever geometry it is run under,
     #    so if training injects the adapter differently from how decoding does,
@@ -178,6 +265,17 @@ def main() -> int:
     #    in the loss curve.
     assert _training_matches_inference(), "training forward != warm inference forward"
     print("[ok] training forward matches warm-mode inference forward")
+
+    # 10. injection_mode="add": the runner's `own + correction` must match the
+    #     same formula computed by hand, in both warm and exit geometry. This
+    #     is the actual new mechanism the real run depends on — everything
+    #     above only exercises the pre-existing `replace` convention.
+    for mode in ("warm", "exit"):
+        ok, diff = _training_matches_inference_add(mode)
+        assert ok, f"add-mode {mode}: runner != hand-computed additive forward " \
+                   f"(max |logit diff| {diff:.2e})"
+        print(f"[ok] injection_mode=add, mode={mode}: runner matches hand-computed "
+              f"additive forward (max |logit diff| {diff:.2e})")
 
     print("\nsmoke_distill_l2s: all checks passed")
     return 0
@@ -209,6 +307,7 @@ def _training_matches_inference(tol: float = 1e-2) -> bool:
     class _A:                                   # minimal adapter for the runner
         def __init__(self):
             self.i, self.j, self.n_params = i, j, 0
+            self.meta = {}
 
         def __call__(self, x):
             return amap(x.float())
@@ -221,6 +320,51 @@ def _training_matches_inference(tol: float = 1e-2) -> bool:
     diff = float((torch.stack(got[:-1]) - train_logits[n_prompt - 1:seq - 1]).abs().max())
     print(f"     (max |logit diff| training vs warm inference: {diff:.2e})")
     return diff < tol
+
+
+def _training_matches_inference_add(mode: str, tol: float = 1e-2) -> tuple[bool, float]:
+    """The `injection_mode="add"` counterpart of `_training_matches_inference`:
+    the runner's `own_i + adapter(x_large)` must match the same formula computed
+    by hand, at every position a greedy decode actually reads a logit from."""
+    from stitching_large_to_small.config import PRESERVE_PREFIX
+    from stitching_large_to_small.stitch import LargeToSmallRunner
+
+    lm_small, lm_large = tiny(D_SMALL, N_SMALL, "S"), tiny(D_LARGE, N_LARGE, "L")
+    i, j, n_prompt, seq = 3, 4, 5, 9
+    ids = torch.randint(0, VOCAB, (1, seq))
+    stack = Stack(lm_small)
+    pos = torch.arange(seq)[None]
+    with torch.no_grad():
+        X = lm_large.model(ids, output_hidden_states=True).hidden_states[j]
+        Y = lm_small.model(ids, output_hidden_states=True).hidden_states[i]
+    W = torch.randn(D_LARGE, D_SMALL) * 0.02
+    b = torch.zeros(D_SMALL)
+    mu_x, sd_x = X[0].mean(0), X[0].std(0) + 1e-6
+    amap = lambda x: ((x - mu_x) / sd_x) @ W + b
+
+    with torch.no_grad():                        # training-time geometry, additive
+        h = Y.clone().float()
+        start = n_prompt if mode == "warm" else PRESERVE_PREFIX
+        inject = torch.arange(start, seq)
+        h[0, inject] = h[0, inject] + amap(X[0, inject].float())
+        out = stack.run(h.to(stack.dtype), pos, i, stack.n_layers, cache=None)
+        train_logits = stack.lm_head(stack.base.norm(out))[0]
+
+    class _A:
+        def __init__(self):
+            self.i, self.j, self.n_params = i, j, 0
+            self.meta = {"injection_mode": "add"}
+
+        def __call__(self, x):
+            return amap(x.float())
+
+    runner = LargeToSmallRunner(lm_small, lm_large, _A(), mode=mode, injection_mode="add")
+    with torch.no_grad():                        # inference-time geometry
+        got = [runner.prefill(ids[:, :n_prompt])[0]]
+        for k in range(n_prompt, seq):
+            got.append(runner.step(int(ids[0, k]), k)[0])
+    diff = float((torch.stack(got[:-1]) - train_logits[n_prompt - 1:seq - 1]).abs().max())
+    return diff < tol, diff
 
 
 if __name__ == "__main__":

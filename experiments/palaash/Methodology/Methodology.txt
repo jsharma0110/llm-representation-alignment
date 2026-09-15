@@ -1,0 +1,20 @@
+Methodology
+(diagram: how_the_stitch_works.png)
+
+We build a hybrid model. The large model's early layers read the prompt; a
+small trained adapter translates its internal representation into the small
+model's representation space; the small model's later layers take over from
+there and produce the final answer. The large model's early layers are never
+fine-tuned -- only the adapter and the small model's later layers are
+trained.
+
+Training uses knowledge distillation. For each training prompt, the large
+model's full forward pass (run once, offline) produces its own answer
+distribution. The adapter and the small model's later layers are then trained
+so that the hybrid model's answer distribution matches it as closely as
+possible.
+
+At answer time, only the large model's early layers and the small model's
+later layers actually run -- the large model's full forward pass is only
+ever needed once, during training, to build the target the adapter learns to
+match.

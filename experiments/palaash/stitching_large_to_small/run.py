@@ -30,9 +30,10 @@ from stitching_large_to_small import data
 from stitching_large_to_small.config import (
     ANSWER_WEIGHT, BANKS, CORPUS_ANSWER_TOKENS, DEFAULT_BANK, DEFAULT_PAIR,
     DISTILL_EPOCHS, DISTILL_LR, DISTILL_TRAIN_MODE, DISTILL_TRAIN_MODES,
-    LEGACY_TRAIN_METHOD, MAX_CI_WIDTH_PTS, MIN_DIVERGENT_PROMPTS, MIN_HEADROOM_PTS,
-    NORM_MATCH, PAIRS, RIDGE_ALPHA, TRAIN_METHOD, TRAIN_METHODS, adapter_path,
-    bench_path, checks_path, results_dir, sweep_path, table_path, validate_layers,
+    INJECTION_MODE, INJECTION_MODES, LEGACY_TRAIN_METHOD, MAX_CI_WIDTH_PTS,
+    MIN_DIVERGENT_PROMPTS, MIN_HEADROOM_PTS, NORM_MATCH, PAIRS, RIDGE_ALPHA,
+    TAIL_LR, TRAIN_METHOD, TRAIN_METHODS, adapter_path, bench_path, checks_path,
+    results_dir, sweep_path, table_path, validate_layers,
 )
 from stitching_large_to_small.evaluate import Harness, format_table, verdict
 from stitching_large_to_small.stitch import run_checks
@@ -68,17 +69,24 @@ def cmd_fit(a):
     kw = {}
     if a.train_method == "distill":
         kw = {"epochs": a.distill_epochs, "lr": a.distill_lr,
-              "train_mode": a.distill_train_mode, "max_seqs": a.distill_max_seqs}
+              "train_mode": a.distill_train_mode, "max_seqs": a.distill_max_seqs,
+              "tail_lr": a.tail_lr}
     adapter_mod.fit(pair, a.i, a.j, bank, train_method=a.train_method,
                     alpha=a.alpha, answer_weight=a.answer_weight,
-                    norm_match=not a.no_norm_match, **kw)
+                    norm_match=not a.no_norm_match,
+                    injection_mode=a.injection_mode,
+                    unfreeze_tail=a.unfreeze_tail, **kw)
 
 
-def _run_and_store_checks(h, pair, bank, i, j, train_method=None) -> list[dict]:
-    checks = run_checks(h.small, h.large, i, j)
-    checks.append(adapter_mod.reload_quality(pair, i, j, bank, train_method,
-                                             lm_small=h.small))
-    out = checks_path(pair, bank, i, j, train_method)
+def _run_and_store_checks(h, pair, bank, i, j, train_method=None,
+                          injection_mode=INJECTION_MODE, unfreeze_tail=False,
+                          modes=()) -> list[dict]:
+    checks = run_checks(h.small, h.large, i, j, injection_mode=injection_mode,
+                        modes=modes)
+    checks.append(adapter_mod.reload_quality(
+        pair, i, j, bank, train_method, lm_small=h.small,
+        injection_mode=injection_mode, unfreeze_tail=unfreeze_tail))
+    out = checks_path(pair, bank, i, j, train_method, injection_mode, unfreeze_tail)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:
         json.dump(checks, f, indent=2)
@@ -100,7 +108,9 @@ def cmd_check(a):
     pair, bank = chosen(a)
     validate_layers(pair, a.i, a.j)
     h = Harness(pair, bank, train_method=method(a))
-    if not _print_checks(_run_and_store_checks(h, pair, bank, a.i, a.j, method(a))):
+    checks = _run_and_store_checks(h, pair, bank, a.i, a.j, method(a),
+                                   a.injection_mode, a.unfreeze_tail)
+    if not _print_checks(checks):
         raise SystemExit(1)
 
 
@@ -182,13 +192,17 @@ def cmd_bench(a):
     h = Harness(pair, bank, train_method=method(a))
     if not a.skip_checks:
         print("[checks] plumbing must pass before accuracy is reported")
-        if not _print_checks(_run_and_store_checks(h, pair, bank, a.i, a.j, method(a))):
+        checks = _run_and_store_checks(h, pair, bank, a.i, a.j, method(a),
+                                       a.injection_mode, a.unfreeze_tail,
+                                       modes=tuple(a.modes))
+        if not _print_checks(checks):
             raise SystemExit("checks FAILED — refusing to report accuracy. "
                              "Fix the injection, or pass --skip-checks to see the "
                              "numbers anyway (they are not trustworthy).")
         print()
     for mode in a.modes:
-        h.bench(a.i, a.j, split=a.split, mode=mode)
+        h.bench(a.i, a.j, split=a.split, mode=mode,
+               injection_mode=a.injection_mode, unfreeze_tail=a.unfreeze_tail)
 
 
 def cmd_final(a):
@@ -205,8 +219,12 @@ def cmd_sweep(a):
     print(f"[sweep] {pair.name}/{bank.name}: {len(combos)} points  "
           f"i={grid_i}  j={grid_j}  modes={a.modes}  train={a.train_method}\n")
 
+    distill_kw = ({"epochs": a.distill_epochs, "lr": a.distill_lr,
+                  "train_mode": a.distill_train_mode, "max_seqs": a.distill_max_seqs,
+                  "tail_lr": a.tail_lr} if tm == "distill" else {})
     for i, j in combos:
-        if a.refit or not adapter_path(pair, i, j, bank, tm).exists():
+        if a.refit or not adapter_path(pair, i, j, bank, tm, a.injection_mode,
+                                       a.unfreeze_tail).exists():
             if tm is None:
                 raise SystemExit(
                     f"adapter for L{j}->L{i} is missing and --train-method "
@@ -215,13 +233,17 @@ def cmd_sweep(a):
                     f"ridge or distill.")
             adapter_mod.fit(pair, i, j, bank, train_method=tm, alpha=a.alpha,
                             answer_weight=a.answer_weight,
-                            norm_match=not a.no_norm_match)
+                            norm_match=not a.no_norm_match,
+                            injection_mode=a.injection_mode,
+                            unfreeze_tail=a.unfreeze_tail, **distill_kw)
 
     h = Harness(pair, bank, train_method=tm)
     if not a.skip_checks:
         i0, j0 = combos[0]
         print("[checks] plumbing must pass before accuracy is reported")
-        if not _print_checks(_run_and_store_checks(h, pair, bank, i0, j0, tm)):
+        checks = _run_and_store_checks(h, pair, bank, i0, j0, tm, a.injection_mode,
+                                       a.unfreeze_tail, modes=tuple(a.modes))
+        if not _print_checks(checks):
             raise SystemExit("checks FAILED — refusing to sweep.")
         print()
 
@@ -229,7 +251,8 @@ def cmd_sweep(a):
     todo = [(i, j, m) for i, j in combos for m in a.modes]
     for n, (i, j, mode) in enumerate(todo, 1):
         print(f"[{n}/{len(todo)}] large L{j} -> small L{i}  mode={mode}")
-        rep = h.bench(i, j, split=a.split, mode=mode, quiet=True)
+        rep = h.bench(i, j, split=a.split, mode=mode, quiet=True,
+                     injection_mode=a.injection_mode, unfreeze_tail=a.unfreeze_tail)
         status, _ = verdict(rep)
         rows.append(sweep_row(rep, status))
         print(f"      acc={rows[-1]['accuracy_stitch']:.1%} "
@@ -239,7 +262,7 @@ def cmd_sweep(a):
     for mode in a.modes:
         sub = [r for r in rows if r["mode"] == mode]
         if sub:
-            _report(pair, bank, a.split, mode, sub, tm)
+            _report(pair, bank, a.split, mode, sub, tm, a.injection_mode, a.unfreeze_tail)
 
 
 def sweep_row(rep: dict, status: str) -> dict:
@@ -274,6 +297,9 @@ def sweep_row(rep: dict, status: str) -> dict:
         "held_out_r2_all": rep["adapter"]["held_out_r2_all"],
         "answer_weight_frac": rep["adapter"].get("answer_weight_frac"),
         "adapter_train_method": rep.get("adapter_train_method", "ridge"),
+        "injection_mode": rep.get("injection_mode", "replace"),
+        "llm_tail_unfrozen": rep.get("llm_tail_unfrozen", False),
+        "practical_win_vs_small_and_large": rep.get("practical_win_vs_small_and_large"),
     }
 
 
@@ -329,9 +355,10 @@ def select(rows: list[dict]) -> dict:
             "n_dominated_by_small": sum(r["dominated_by_small"] for r in rows)}
 
 
-def _report(pair, bank, split, mode, rows, train_method=None):
-    jp = sweep_path(pair, bank, split, mode, train_method)
-    tp = table_path(pair, bank, split, mode, train_method)
+def _report(pair, bank, split, mode, rows, train_method=None,
+           injection_mode=INJECTION_MODE, unfreeze_tail=False):
+    jp = sweep_path(pair, bank, split, mode, train_method, injection_mode, unfreeze_tail)
+    tp = table_path(pair, bank, split, mode, train_method, injection_mode, unfreeze_tail)
     for p in (jp, tp):
         p.parent.mkdir(parents=True, exist_ok=True)
     pick = select(rows)
@@ -508,6 +535,26 @@ def main():
                             "reproduces; must match the mode you bench")
         p.add_argument("--distill-max-seqs", type=int, default=None,
                        help="cap training sequences (smoke runs only)")
+        p.add_argument("--tail-lr", type=float, default=TAIL_LR,
+                       help="learning rate for the small model's suffix under "
+                            "--unfreeze-tail (ignored otherwise)")
+
+    def injection_opts(p, allow_unfreeze=True):
+        p.add_argument("--injection-mode", choices=INJECTION_MODES,
+                       default=INJECTION_MODE,
+                       help="replace: the adapter's output overwrites the small "
+                            "model's own residual at block i. add: it corrects "
+                            "the small model's own residual instead — only "
+                            "fittable under --train-method distill, warm-started "
+                            "from a zero map so epoch 0 is the unmodified small "
+                            "model (default: %(default)s)")
+        if allow_unfreeze:
+            p.add_argument("--unfreeze-tail", action="store_true",
+                           help="let the small model's own blocks i..end train "
+                                "alongside the adapter (requires --train-method "
+                                "distill). This is NOT a frozen-LLM result — "
+                                "every artefact it produces is labelled "
+                                "llm_tail_unfrozen=true")
 
     def modes(p):
         p.add_argument("--modes", nargs="+", choices=("exit", "warm"), default=["exit"],
@@ -546,21 +593,22 @@ def main():
     p.set_defaults(func=cmd_capture)
 
     p = sub.add_parser("fit", help="fit one large->small adapter")
-    common(p); layers(p); fit_opts(p); distill_opts(p)
+    common(p); layers(p); fit_opts(p); distill_opts(p); injection_opts(p)
     train_method_opt(p, allow_legacy=False)
     p.set_defaults(func=cmd_fit)
 
     p = sub.add_parser("check", help="plumbing checks for one (i, j)")
-    common(p); layers(p); train_method_opt(p)
+    common(p); layers(p); train_method_opt(p); injection_opts(p)
+    p.add_argument("--modes", nargs="+", choices=("exit", "warm"), default=())
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("bench", help="small vs large vs stitched")
-    common(p); layers(p); modes(p); train_method_opt(p)
+    common(p); layers(p); modes(p); train_method_opt(p); injection_opts(p)
     p.add_argument("--split", default="dev", choices=("fit", "dev", "test", "all"))
     p.set_defaults(func=cmd_bench)
 
     p = sub.add_parser("final", help="bench on the untouched test split")
-    common(p); layers(p); modes(p); train_method_opt(p)
+    common(p); layers(p); modes(p); train_method_opt(p); injection_opts(p)
     p.set_defaults(func=cmd_final)
 
     p = sub.add_parser("compare", help="ridge vs distill at one cell, from disk")
@@ -572,7 +620,7 @@ def main():
     p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("sweep", help="grid over (i, j)")
-    common(p); fit_opts(p); modes(p); train_method_opt(p)
+    common(p); fit_opts(p); modes(p); train_method_opt(p); distill_opts(p); injection_opts(p)
     p.add_argument("--split", default="dev", choices=("fit", "dev", "test", "all"))
     p.add_argument("--grid-i", type=int, nargs="+", default=None)
     p.add_argument("--grid-j", type=int, nargs="+", default=None)

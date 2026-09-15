@@ -1,0 +1,14 @@
+Conclusion
+
+Directly transplanting a piece of a large language model's internal
+representation into a small model's forward pass -- rather than only
+training the small model on the large model's outputs -- recovers most of
+the accuracy gap between the two models, closing to within 9.4 points of the
+large model while running with lower latency than the large model does on
+its own.
+
+This suggests that two differently-sized models from the same family share
+enough representational structure that a small, targeted bridge can move
+real capability across model sizes: not just imitating what the large model
+tends to say, but reusing how the large model actually arrived at its
+answer.

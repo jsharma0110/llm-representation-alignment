@@ -1,0 +1,4 @@
+label,n_eval,accuracy,accuracy_drop_vs_large_pts,divergent_accuracy,n_divergent,mean_ms_per_answer,speedup_vs_large,notes
+Llama-3B_alone,422,0.985781990521327,0.0,1.0,99,270.5104925340898,1.0,reference (what the hint is graded against)
+Qwen-0.5B_alone,422,0.7582938388625592,22.748815165876778,0.0,99,81.85254301494031,3.304851414142555,"cheap baseline, no large-model involvement"
+Qwen-0.5B_plus_Llama-3B_hint,422,0.8436018957345972,14.218009478672977,0.5555555555555556,99,366.5865990697402,0.7379170248463647,"text-bridge hybrid: large generates a hint, small gives the scored answer"

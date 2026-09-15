@@ -21,11 +21,12 @@ from common.decoding import FullRunner, eos_ids, greedy, warmup
 from common.model_utils import build_prompt_ids, load_lm, pick_device
 from common.scoring import score
 from common.stats import fmt_pct_ci, separated, wilson, wilson_from_rate
-from stitching_large_to_small.adapter import TorchAdapter
+from stitching_large_to_small.adapter import TorchAdapter, apply_tail, load_tail_state
 from stitching_large_to_small.adapter import load as load_adapter
+from stitching_large_to_small.adapter import tail_path as adapter_tail_path
 from stitching_large_to_small.config import (
-    LATENCY_PROMPTS, LATENCY_REPEATS, LATENCY_SPREAD_FLAG, Bank, Pair, bench_path,
-    results_dir,
+    INJECTION_MODE, LATENCY_PROMPTS, LATENCY_REPEATS, LATENCY_SPREAD_FLAG, Bank,
+    Pair, bench_path, results_dir,
 )
 from stitching_large_to_small.data import split_prompts
 from stitching_large_to_small.stitch import LargeToSmallRunner
@@ -52,6 +53,13 @@ class Harness:
         self.stop = eos_ids(self.small)
         self._acc: dict[str, dict] = {}
         self._adapters: dict[tuple[int, int], TorchAdapter] = {}
+        # A tail-unfrozen adapter needs its own small-model instance: applying
+        # its fine-tuned weights to `self.small` would corrupt the small-model
+        # baseline every other cell in this session is scored against. Loaded
+        # lazily, once, and reused/re-patched for whichever unfrozen adapter is
+        # asked for.
+        self._small_tail = None
+        self._small_tail_key = None
 
     def ids_for(self, question: str) -> torch.Tensor:
         return build_prompt_ids(self.small.tokenizer, question, self.device,
@@ -60,14 +68,39 @@ class Harness:
     def decode(self, token_ids: list[int]) -> str:
         return self.small.tokenizer.decode(token_ids, skip_special_tokens=True).strip()
 
-    def adapter(self, i: int, j: int) -> TorchAdapter:
-        if (i, j) not in self._adapters:
-            arrays, meta = load_adapter(self.pair, i, j, self.bank, self.train_method)
-            self._adapters[(i, j)] = TorchAdapter(arrays, meta, self.device)
-        return self._adapters[(i, j)]
+    def adapter(self, i: int, j: int, injection_mode: str = INJECTION_MODE,
+               unfreeze_tail: bool = False) -> TorchAdapter:
+        key = (i, j, injection_mode, unfreeze_tail)
+        if key not in self._adapters:
+            arrays, meta = load_adapter(self.pair, i, j, self.bank, self.train_method,
+                                        injection_mode, unfreeze_tail)
+            self._adapters[key] = TorchAdapter(arrays, meta, self.device)
+        return self._adapters[key]
 
-    def stitch_runner(self, i: int, j: int, mode: str = "exit") -> LargeToSmallRunner:
-        return LargeToSmallRunner(self.small, self.large, self.adapter(i, j), mode=mode)
+    def small_for_stitch(self, i: int, j: int, injection_mode: str, unfreeze_tail: bool):
+        """The small-model instance a stitch runner should use: the shared
+        pristine one, unless this cell's adapter carries a fine-tuned tail, in
+        which case a separate patched instance — never `self.small` itself."""
+        if not unfreeze_tail:
+            return self.small
+        key = (i, j, injection_mode)
+        if self._small_tail_key != key:
+            if self._small_tail is None:
+                self._small_tail = load_lm(self.pair.small_id, self.pair.small_tag,
+                                           self.device)
+            path = adapter_tail_path(self.pair, i, j, self.bank, self.train_method,
+                                     injection_mode, True)
+            apply_tail(self._small_tail, i, load_tail_state(path))
+            self._small_tail_key = key
+        return self._small_tail
+
+    def stitch_runner(self, i: int, j: int, mode: str = "exit",
+                      injection_mode: str = INJECTION_MODE,
+                      unfreeze_tail: bool = False) -> LargeToSmallRunner:
+        small = self.small_for_stitch(i, j, injection_mode, unfreeze_tail)
+        return LargeToSmallRunner(small, self.large,
+                                  self.adapter(i, j, injection_mode, unfreeze_tail),
+                                  mode=mode, injection_mode=injection_mode)
 
     # ── the two measurements ──────────────────────────────────────────────────
     @torch.no_grad()
@@ -127,17 +160,20 @@ class Harness:
                 "accuracy": self._acc[key]}
 
     def bench(self, i: int, j: int, split: str = "dev", mode: str = "exit",
-              quiet: bool = False) -> dict:
+              quiet: bool = False, injection_mode: str = INJECTION_MODE,
+              unfreeze_tail: bool = False) -> dict:
         prompts = split_prompts(self.bank, split)
         small = self.baseline("small", split, prompts)
         large = self.baseline("large", split, prompts)
-        runner = self.stitch_runner(i, j, mode)
+        runner = self.stitch_runner(i, j, mode, injection_mode, unfreeze_tail)
         stitch = {"label": runner.label, "latency": self.latency(runner, prompts),
                   "accuracy": self.accuracy(runner, prompts)}
 
         rep = summarise(self.pair, self.bank, i, j, split, mode, self.device,
-                        small, large, stitch, self.adapter(i, j).meta)
-        path = bench_path(self.pair, i, j, split, mode, self.bank, self.train_method)
+                        small, large, stitch,
+                        self.adapter(i, j, injection_mode, unfreeze_tail).meta)
+        path = bench_path(self.pair, i, j, split, mode, self.bank, self.train_method,
+                          injection_mode, unfreeze_tail)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(rep, f, indent=2)
@@ -262,6 +298,8 @@ def summarise(pair: Pair, bank: Bank, i: int, j: int, split: str, mode: str,
         "n_prompts": n,
         "adapter_kind": adapter_meta.get("kind", "linear"),
         "adapter_train_method": adapter_meta.get("train_method", "legacy_ridge"),
+        "injection_mode": adapter_meta.get("injection_mode", "replace"),
+        "llm_tail_unfrozen": adapter_meta.get("llm_tail_unfrozen", False),
         "seed_provenance": {"seed": adapter_meta.get("seed"),
                             "ridge_alpha": adapter_meta.get("ridge_alpha"),
                             "answer_weight": adapter_meta.get("answer_weight"),
@@ -274,6 +312,14 @@ def summarise(pair: Pair, bank: Bank, i: int, j: int, split: str, mode: str,
         # means anything at n in the low hundreds: strictly above the small
         # model with non-overlapping 95% intervals.
         "beats_small_ci": bool(separated(nc["stitch"], n, nc["small"], n)),
+        # A different, looser bar than the one above: strictly more accurate
+        # than the small model alone (point estimate, no CI requirement) AND
+        # strictly cheaper end-to-end than running the large model alone. This
+        # is not the experiment's publication bar — see `beats_small_ci` for
+        # that — but it is the practical question "is this hybrid ever worth
+        # deploying over either model alone", answered plainly.
+        "practical_win_vs_small_and_large": bool(
+            a_x > a_s and e2e["stitch"] < e2e["large"]),
         "acc_gain_vs_small_pts": (a_x - a_s) * 100,
         "acc_gap_vs_large_pts": (a_x - a_l) * 100,
         "answer_tokens_priced": n_ref,
@@ -376,7 +422,9 @@ def verdict(rep: dict) -> tuple[str, str]:
 def format_table(rep: dict) -> str:
     head = (f"{rep['pair']}/{rep['bank']}  large L{rep['large_layer_j']} -> "
             f"small L{rep['small_layer_i']}  train={rep.get('adapter_train_method')}  "
-            f"mode={rep['mode']}  split={rep['split']}  "
+            f"injection={rep.get('injection_mode', 'replace')}"
+            + ("+unfrozen_tail" if rep.get("llm_tail_unfrozen") else "")
+            + f"  mode={rep['mode']}  split={rep['split']}  "
             f"n={rep['n_prompts']}  device={rep['device']}")
     lines = [head, "-" * len(head),
              f"{'path':<26}{'acc (95% CI)':>22}{'divergent':>11}{'ms/tok':>9}"
@@ -407,6 +455,8 @@ def format_table(rep: dict) -> str:
               f"           {rep['acc_gain_vs_small_pts']:+.1f} pts vs small, "
               f"{rep['acc_gap_vs_large_pts']:+.1f} pts vs large; beats small at 95%: "
               f"{'YES' if rep.get('beats_small_ci') else 'NO'}",
+              f"practical win (more accurate than small AND cheaper e2e than "
+              f"large): {'YES' if rep.get('practical_win_vs_small_and_large') else 'NO'}",
               f"cost       {rep['decode_slowdown_vs_small']:.2f}x the small model's "
               f"ms/token, {rep.get('end_to_end_slowdown_vs_small', float('nan')):.2f}x "
               f"its end-to-end time ({rep['decode_speedup_vs_large']:.2f}x decode "

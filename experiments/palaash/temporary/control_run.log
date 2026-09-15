@@ -1,0 +1,88 @@
+[main] device=mps  i=8  j=14  mode=exit  injection=add  smoke=False
+[load] 1B: meta-llama/Llama-3.2-1B-Instruct -> mps
+Loading weights:   0%|          | 0/146 [00:00<?, ?it/s]Loading weights:   1%|          | 1/146 [00:00<00:20,  7.00it/s]Loading weights:  22%|██▏       | 32/146 [00:00<00:00, 154.43it/s]Loading weights:  40%|███▉      | 58/146 [00:00<00:00, 196.38it/s]Loading weights:  59%|█████▉    | 86/146 [00:00<00:00, 224.07it/s]Loading weights:  82%|████████▏ | 120/146 [00:00<00:00, 259.32it/s]Loading weights: 100%|██████████| 146/146 [00:00<00:00, 221.92it/s]
+[load] 3B: meta-llama/Llama-3.2-3B-Instruct -> mps
+Loading weights:   0%|          | 0/254 [00:00<?, ?it/s]Loading weights:   0%|          | 1/254 [00:00<00:45,  5.61it/s]Loading weights:   7%|▋         | 18/254 [00:00<00:03, 78.50it/s]Loading weights:  13%|█▎        | 34/254 [00:00<00:02, 109.76it/s]Loading weights:  19%|█▉        | 48/254 [00:00<00:01, 115.15it/s]Loading weights:  24%|██▍       | 61/254 [00:00<00:01, 110.02it/s]Loading weights:  30%|██▉       | 76/254 [00:00<00:01, 118.68it/s]Loading weights:  35%|███▌      | 89/254 [00:01<00:02, 64.23it/s] Loading weights:  41%|████      | 103/254 [00:01<00:01, 76.50it/s]Loading weights:  46%|████▌     | 117/254 [00:01<00:01, 88.97it/s]Loading weights:  51%|█████     | 129/254 [00:01<00:01, 91.74it/s]Loading weights:  56%|█████▌    | 141/254 [00:01<00:01, 62.57it/s]Loading weights:  61%|██████▏   | 156/254 [00:01<00:01, 76.89it/s]Loading weights:  66%|██████▌   | 167/254 [00:02<00:01, 80.10it/s]Loading weights:  70%|██████▉   | 177/254 [00:02<00:01, 57.70it/s]Loading weights:  73%|███████▎  | 185/254 [00:02<00:01, 58.29it/s]Loading weights:  78%|███████▊  | 198/254 [00:02<00:00, 71.31it/s]Loading weights:  83%|████████▎ | 210/254 [00:02<00:00, 80.46it/s]Loading weights:  87%|████████▋ | 220/254 [00:02<00:00, 84.47it/s]Loading weights:  91%|█████████ | 230/254 [00:03<00:00, 58.25it/s]Loading weights:  94%|█████████▎| 238/254 [00:03<00:00, 61.77it/s]Loading weights:  98%|█████████▊| 248/254 [00:03<00:00, 68.99it/s]Loading weights: 100%|██████████| 254/254 [00:03<00:00, 75.91it/s]
+[data] 911 fit items (211 bank + 700 generic corpus, matching D's exact recipe)
+[capture] teacher-forcing + tapping layer 14 (3B) / layer 8 (1B) ...
+  [capture] 1/911
+  [capture] 101/911
+  [capture] 201/911
+  [capture] 301/911
+  [capture] 401/911
+  [capture] 501/911
+  [capture] 601/911
+  [capture] 701/911
+  [capture] 801/911
+  [capture] 901/911
+  [capture] 911/911
+[transformers] Ignoring clean_up_tokenization_spaces=True for BPE tokenizer TokenizersBackend. The clean_up_tokenization post-processing step is designed for WordPiece tokenizers and is destructive for BPE (it strips spaces before punctuation). Set clean_up_tokenization_spaces=False to suppress this warning, or set clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output=True to force cleanup anyway.
+[capture] 88746 rows in 1917s
+[capture] cached
+[eval] dev split: 106 prompts
+[A] 1B alone
+[ref] 3B alone
+  1B: acc=74.5%   3B: acc=98.1%   divergent (1B wrong, 3B right): 26
+[freeze] freezing all of 1B and 3B
+
+[C] frozen stitch (exit+add), i=8 j=14
+  [distill] mode=exit injection=add unfreeze_tail=False  729 train / 182 val sequences, warm start val loss 0.6197
+  [distill]   epoch 1 200/729 seqs, running train 0.4936
+  [distill]   epoch 1 400/729 seqs, running train 0.4698
+  [distill]   epoch 1 600/729 seqs, running train 0.4346
+  [distill] epoch 1: train 0.4184  val 0.3717  (best 0.3717)
+  [distill]   epoch 2 200/729 seqs, running train 0.3460
+  [distill]   epoch 2 400/729 seqs, running train 0.3502
+  [distill]   epoch 2 600/729 seqs, running train 0.3365
+  [distill] epoch 2: train 0.3353  val 0.3529  (best 0.3529)
+  [distill]   epoch 3 200/729 seqs, running train 0.3038
+  [distill]   epoch 3 400/729 seqs, running train 0.3072
+  [distill]   epoch 3 600/729 seqs, running train 0.3124
+  [distill] epoch 3: train 0.3039  val 0.3422  (best 0.3422)
+  [distill]   epoch 4 200/729 seqs, running train 0.2811
+  [distill]   epoch 4 400/729 seqs, running train 0.2808
+  [distill]   epoch 4 600/729 seqs, running train 0.2819
+  [distill] epoch 4: train 0.2812  val 0.3364  (best 0.3364)
+  [C] val KL: 0.6197 -> 0.3364 @ epoch 4
+  [C] acc=87.7%  divergent_acc=65.4%
+
+[B] tail fine-tuned on 3B teacher, NO stitch, blocks 8..15
+  [freeze check] tail params=486,572,032 (blocks 8..15)
+  [train-B] 729 train / 182 val sequences, unmodified-1B val loss 0.6197
+  [train-B]   epoch 1 200/729  running train 0.5775
+  [train-B]   epoch 1 400/729  running train 0.5868
+  [train-B]   epoch 1 600/729  running train 0.5733
+  [train-B] epoch 1: train 0.5570  val 0.5132  (best 0.5132)
+  [train-B]   epoch 2 200/729  running train 0.4806
+  [train-B]   epoch 2 400/729  running train 0.4876
+  [train-B]   epoch 2 600/729  running train 0.4673
+  [train-B] epoch 2: train 0.4569  val 0.4744  (best 0.4744)
+  [train-B]   epoch 3 200/729  running train 0.4370
+  [train-B]   epoch 3 400/729  running train 0.4351
+  [train-B]   epoch 3 600/729  running train 0.4364
+  [train-B] epoch 3: train 0.4197  val 0.4562  (best 0.4562)
+  [train-B]   epoch 4 200/729  running train 0.3742
+  [train-B]   epoch 4 400/729  running train 0.3840
+  [train-B]   epoch 4 600/729  running train 0.3897
+  [train-B] epoch 4: train 0.3973  val 0.4443  (best 0.4443)
+  [B] val KL: 0.6197 -> 0.4443 @ epoch 4
+  [B] acc=83.0%  divergent_acc=42.3%
+
+[D] read from disk: bench_i08_j14_dev_exit_distill_add_unfroze.json
+  [D] acc=88.7%  small=70.8%  divergent_acc=76.7%  beats_small_ci=True
+
+[done] wrote /Users/nova/Desktop/UMass/Summer URV/git merge/llm-representation-alignment/experiments/palaash/temporary/results_control_ABCD.csv
+
+======================================================================
+condition                       accuracy   divergent acc
+A_1B_alone                        74.5%            0.0%
+B_tail_tuned_no_stitch            83.0%           42.3%
+C_frozen_stitch_exit_add          87.7%           65.4%
+D_unfrozen_stitch_exit_add_ONDISK    88.7%           76.7%
+3B_alone_ref                      98.1%          100.0%
+
+n_divergent (1B wrong, 3B right, this session's own A/3B run): 26
+
+Interpretation:
+  C vs A:        C >> A -> real frozen-stitch win
+  D vs A, D vs B: D >> B -> unfreezing AND the 3B mid-layers both add something

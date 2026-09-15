@@ -1,0 +1,19 @@
+Research Goal
+
+Recover as much of a large language model's accuracy as possible through a
+small model's forward pass, by directly transplanting ("stitching") a piece
+of the large model's internal representation into the small model -- rather
+than only training the small model on the large model's final outputs.
+
+Specifically: given a small and a large model from the same model family (so
+they share a tokenizer and can be compared token-for-token), can a
+lightweight trained adapter carry the large model's reading of a prompt into
+the small model's later layers, so the small model finishes the answer with
+more of the large model's knowledge than it has on its own? And does this get
+closer to the large model's accuracy for less cost than simply running the
+large model?
+
+This project tests that question on a small and a large model from the same
+family (1B and 3B parameters), on a held-out factual question-answering
+benchmark chosen specifically because the two models disagree often enough to
+measure a real gain.

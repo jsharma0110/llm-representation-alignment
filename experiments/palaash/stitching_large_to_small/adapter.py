@@ -42,9 +42,10 @@ import numpy as np
 import torch
 
 from stitching_large_to_small.config import (
-    ADAPTER_TEST_FRAC, ANSWER_WEIGHT, MIN_ANSWER_WEIGHT_FRAC, NORM_MATCH,
-    PROMPT_ROW_KEEP, RIDGE_ALPHA, SEED, TRAIN_METHOD, TRAIN_METHODS, Bank, Pair,
-    adapter_path, adapters_dir, states_dir, validate_layers,
+    ADAPTER_TEST_FRAC, ANSWER_WEIGHT, INJECTION_MODE, INJECTION_MODES,
+    MIN_ANSWER_WEIGHT_FRAC, NORM_MATCH, PROMPT_ROW_KEEP, RIDGE_ALPHA, SEED,
+    TRAIN_METHOD, TRAIN_METHODS, Bank, Pair, adapter_path, adapters_dir,
+    states_dir, validate_layers,
 )
 from stitching_large_to_small.data import load_layer_pair, select_fit_rows
 
@@ -112,9 +113,30 @@ def apply_map(m: dict, X: np.ndarray) -> np.ndarray:
     return apply_np(X, m["W"], m["b"], m["mu_x"], m["sd_x"])
 
 
+def zero_map(dim_in: int, dim_out: int) -> dict:
+    """The correction that changes nothing: `apply_map` returns all-zero rows
+    regardless of `X`, so `own + zero_map(X)` is exactly `own`.
+
+    This is the warm start for `injection_mode="add"`. Ridge's target is `Y`,
+    the small model's own residual, so a ridge-fit *delta to itself* is
+    trivially zero and the objective has nothing to say about what correction
+    should be added — there is no separate "desired state" to regress a
+    delta onto. Starting the correction at exactly zero instead makes epoch 0
+    of an `add` run the unmodified small model, a real and checkable baseline
+    (see `check_zero_add_reproduces_small` in stitch.py), rather than an
+    arbitrary point in delta-space.
+    """
+    return {"W": np.zeros((dim_in, dim_out), np.float32),
+            "b": np.zeros(dim_out, np.float32),
+            "mu_x": np.zeros(dim_in, np.float32),
+            "sd_x": np.ones(dim_in, np.float32),
+            "mu_y": np.zeros(dim_out, np.float32)}
+
+
 def _distil(pair: Pair, bank: Bank, i: int, j: int, base_map: dict,
             X: np.ndarray, Y: np.ndarray, pid: np.ndarray, is_answer: np.ndarray,
-            lm_small, lm_large, verbose: bool, **kw) -> tuple[dict, dict]:
+            lm_small, lm_large, verbose: bool, injection_mode: str = INJECTION_MODE,
+            unfreeze_tail: bool = False, **kw) -> tuple[dict, dict, dict | None]:
     """Run the distillation pass on top of a fitted ridge map.
 
     Imported here rather than at module scope so the numpy-only paths (`fit`
@@ -141,25 +163,43 @@ def _distil(pair: Pair, bank: Bank, i: int, j: int, base_map: dict,
         lm_small = load_lm(pair.small_id, pair.small_tag, pick_device())
     return distill.train(pair, bank, i, j, base_map, lm_small, X, Y, pid,
                          is_answer, position, t_vals, t_idx, lm_large=lm_large,
-                         verbose=verbose, **kw)
+                         verbose=verbose, injection_mode=injection_mode,
+                         unfreeze_tail=unfreeze_tail, **kw)
 
 
 def fit(pair: Pair, i: int, j: int, bank: Bank,
         train_method: str = TRAIN_METHOD, alpha: float = RIDGE_ALPHA,
         answer_weight: float = ANSWER_WEIGHT, norm_match: bool = NORM_MATCH,
         prompt_row_policy=PROMPT_ROW_KEEP, lm_small=None, lm_large=None,
-        verbose: bool = True, **distill_kw) -> dict:
+        verbose: bool = True, injection_mode: str = INJECTION_MODE,
+        unfreeze_tail: bool = False, **distill_kw) -> dict:
     """Fit and save the large->small adapter for one (i, j).
 
     `train_method="distill"` fits the same map shape against the large model's
     next-token distribution instead of the small model's hidden states,
     warm-started from the ridge solution computed here. Both land in separately
     scoped files, so the head-to-head at fixed geometry is always on disk.
+
+    `injection_mode="add"` only makes sense under distillation (see
+    `config.INJECTION_MODE`): ridge's target is `Y` itself, so a ridge-fit
+    delta-to-`Y` is identically zero and there is nothing for ridge to fit.
+    The ridge solution computed below is still reported for reference, but the
+    map handed to distillation as its warm start is the zero map instead.
     """
     validate_layers(pair, i, j)
     if train_method not in TRAIN_METHODS:
         raise SystemExit(f"--train-method must be one of {TRAIN_METHODS}, "
                          f"got {train_method!r}")
+    if injection_mode not in INJECTION_MODES:
+        raise SystemExit(f"--injection-mode must be one of {INJECTION_MODES}, "
+                         f"got {injection_mode!r}")
+    if injection_mode == "add" and train_method != "distill":
+        raise SystemExit(
+            "--injection-mode add requires --train-method distill: ridge's "
+            "target is the small model's own residual, so a ridge-fit delta "
+            "to that same residual is identically zero.")
+    if unfreeze_tail and train_method != "distill":
+        raise SystemExit("--unfreeze-tail requires --train-method distill.")
     X, Y, pid, is_answer = load_layer_pair(pair, i, j, bank)
 
     # ── row selection: make answer positions the objective ────────────────────
@@ -202,10 +242,19 @@ def fit(pair: Pair, i: int, j: int, bank: Bank,
     m, gain = _ridge_map(Xf, Yf, w, ans, alpha, norm_match)
 
     distill_meta = {}
+    tail_state = None
     if train_method == "distill":
         m_ridge = dict(m)
-        m, distill_meta = _distil(pair, bank, i, j, m, X, Y, pid, is_answer,
-                                  lm_small, lm_large, verbose, **distill_kw)
+        # `add` cannot warm-start from ridge: ridge's target is `Y` itself, so
+        # fitting a delta to `Y` against `Y` is identically zero and carries no
+        # information. The zero map is not a placeholder here — it is the
+        # correct warm start, since it makes epoch 0 the unmodified small
+        # model exactly.
+        base = m if injection_mode == "replace" else zero_map(pair.dim_large, pair.dim_small)
+        m, distill_meta, tail_state = _distil(pair, bank, i, j, base, X, Y, pid,
+                                              is_answer, lm_small, lm_large, verbose,
+                                              injection_mode=injection_mode,
+                                              unfreeze_tail=unfreeze_tail, **distill_kw)
         # Both maps scored on the same rows, and both of them were fit on those
         # rows — so this pair is comparable to *each other* and not to the
         # `held_out` block above, which refits on a subset and is the honest
@@ -219,6 +268,12 @@ def fit(pair: Pair, i: int, j: int, bank: Bank,
         # honest before/after for distillation is `distill_val_loss_ridge` vs
         # `distill_val_loss_best` — a KL on prompts held out of the training
         # loop, in the units the objective actually minimises.
+        #
+        # Under `injection_mode="add"` the map's raw output is a *delta*, not
+        # a prediction of `Y`, so these R2/cosine numbers against `Y` are not
+        # comparable to the `replace`-mode numbers above or to the sibling
+        # cells — they are kept only as a sanity readout (e.g. catching a
+        # delta that has blown up) and labelled as such in the sidecar.
         pairwise = {}
         for name, mm in (("ridge", m_ridge), ("distill", m)):
             Yh_x = apply_map(mm, Xf[te])
@@ -229,20 +284,33 @@ def fit(pair: Pair, i: int, j: int, bank: Bank,
                        "before_distill_same_rows": pairwise["ridge"],
                        "after_distill_note":
                            "both maps were fit on these rows; compare the two to "
-                           "each other, not to held_out"}
+                           "each other, not to held_out"
+                           + ("" if injection_mode == "replace" else
+                              "; injection_mode=add, so these R2 numbers are "
+                              "against the raw delta output, not against Y — "
+                              "not comparable to replace-mode numbers")}
 
     in_sample = quality(apply_map(m, Xf), Yf)
 
     adapters_dir(pair, bank).mkdir(parents=True, exist_ok=True)
-    path = adapter_path(pair, i, j, bank, train_method)
+    path = adapter_path(pair, i, j, bank, train_method, injection_mode, unfreeze_tail)
     np.savez(path, **{k: v.astype(np.float32) for k, v in m.items()})
+    if tail_state is not None:
+        # `lm_small.model`'s suffix blocks were fine-tuned in place during
+        # distillation and would otherwise vanish once that (usually ephemeral)
+        # model object is discarded. Saved alongside the adapter under the same
+        # scoped name so `evaluate.Harness` can find and apply it.
+        torch.save(tail_state, path.with_suffix(".tail.pt"))
     meta = {
         "pair": pair.name, "bank": bank.name, "direction": "large->small",
         "small_layer_i": i, "large_layer_j": j,
         "train_method": train_method,
+        "injection_mode": injection_mode,
+        "llm_tail_unfrozen": unfreeze_tail,
         "dim_in_large": pair.dim_large, "dim_out_small": pair.dim_small,
         "depth_matched_i": pair.depth_matched_i(j),
-        "form": "Y_hat = ((X - mu_x) / sd_x) @ W + b",
+        "form": ("Y_hat = ((X - mu_x) / sd_x) @ W + b" if injection_mode == "replace"
+                 else "h_i = own_i + ((X - mu_x) / sd_x) @ W + b"),
         "injection_point": f"input to small decoder block {i}",
         "source_point": f"input to large decoder block {j}",
         "ridge_alpha": alpha, "answer_weight": answer_weight,
@@ -308,9 +376,35 @@ def _capture_provenance(pair: Pair, bank: Bank) -> dict:
              "corpus_answer_tokens", "teacher_logits", "teacher_topk")}
 
 
+def tail_path(pair: Pair, i: int, j: int, bank: Bank,
+             train_method: str | None = None, injection_mode: str = INJECTION_MODE,
+             unfreeze_tail: bool = True):
+    return adapter_path(pair, i, j, bank, train_method, injection_mode,
+                        unfreeze_tail).with_suffix(".tail.pt")
+
+
+def load_tail_state(path) -> dict:
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def apply_tail(lm_small, i: int, tail_state: dict) -> None:
+    """Load a fine-tuned tail's weights onto blocks `i..end` of `lm_small` in
+    place. Only ever call this on a model instance nothing else is relying on
+    staying pristine — see `evaluate.Harness`, which keeps a separate copy for
+    exactly this reason."""
+    from common.decoding import Stack
+    stack = Stack(lm_small)
+    with torch.no_grad():
+        for k, layer in enumerate(stack.layers[i:]):
+            named = dict(layer.named_parameters())
+            for name, p in named.items():
+                p.copy_(tail_state[f"layer_{i + k}.{name}"].to(p.device, p.dtype))
+
+
 def load(pair: Pair, i: int, j: int, bank: Bank,
-         train_method: str | None = None) -> tuple[dict, dict]:
-    path = adapter_path(pair, i, j, bank, train_method)
+         train_method: str | None = None, injection_mode: str = INJECTION_MODE,
+         unfreeze_tail: bool = False) -> tuple[dict, dict]:
+    path = adapter_path(pair, i, j, bank, train_method, injection_mode, unfreeze_tail)
     if not path.exists():
         raise SystemExit(
             f"{path.name} not found — run `python -m stitching_large_to_small.run fit "
@@ -323,7 +417,9 @@ def load(pair: Pair, i: int, j: int, bank: Bank,
 
 
 def reload_quality(pair: Pair, i: int, j: int, bank: Bank,
-                   train_method: str | None = None, lm_small=None) -> dict:
+                   train_method: str | None = None, lm_small=None,
+                   injection_mode: str = INJECTION_MODE,
+                   unfreeze_tail: bool = False) -> dict:
     """Re-load the saved coefficients and re-score them on held-out rows.
 
     A gating check, not a metric: it catches a map that was saved wrong, or
@@ -339,7 +435,7 @@ def reload_quality(pair: Pair, i: int, j: int, bank: Bank,
     loss selected it. Replaying the recorded probe through the frozen suffix is
     the only check that would notice.
     """
-    arrays, meta = load(pair, i, j, bank, train_method)
+    arrays, meta = load(pair, i, j, bank, train_method, injection_mode, unfreeze_tail)
     X, Y, pid, is_answer = load_layer_pair(pair, i, j, bank)
     pids = np.unique(pid)
     rng = np.random.default_rng(SEED)
@@ -384,13 +480,25 @@ def reload_quality(pair: Pair, i: int, j: int, bank: Bank,
     else:
         inject = a
 
-    lm_small = lm_small or load_lm(pair.small_id, pair.small_tag, pick_device())
-    stack = Stack(lm_small)
+    # A tail-unfrozen adapter's probe was recorded through the *fine-tuned*
+    # suffix, so replaying it against the pristine model would fail for a
+    # reason that has nothing to do with the file round-tripping. Use a
+    # throwaway model instance for that case rather than mutating whatever
+    # `lm_small` the caller passed in — `evaluate.Harness` passes its shared
+    # baseline model, which must stay pristine for its own accuracy numbers.
+    if meta.get("llm_tail_unfrozen"):
+        probe_lm = load_lm(pair.small_id, pair.small_tag, pick_device())
+        apply_tail(probe_lm, i, load_tail_state(
+            tail_path(pair, i, j, bank, train_method, injection_mode, True)))
+    else:
+        probe_lm = lm_small or load_lm(pair.small_id, pair.small_tag, pick_device())
+    stack = Stack(probe_lm)
     with torch.no_grad():
-        to = lambda v: torch.from_numpy(np.ascontiguousarray(v)).to(lm_small.device)
+        to = lambda v: torch.from_numpy(np.ascontiguousarray(v)).to(probe_lm.device)
         h = to(Y[idx]).to(torch.float32).unsqueeze(0).clone()
-        h[0, to(np.flatnonzero(inject)).long()] = to(
-            apply_map(arrays, X[idx][inject])).to(torch.float32)
+        inj = to(np.flatnonzero(inject)).long()
+        correction = to(apply_map(arrays, X[idx][inject])).to(torch.float32)
+        h[0, inj] = (h[0, inj] + correction) if meta.get("injection_mode") == "add" else correction
         pos = to(position[idx]).long().unsqueeze(0)
         hs = stack.run(h.to(stack.dtype), pos, i, stack.n_layers, cache=None)
         got = stack.lm_head(stack.base.norm(hs))[0][-1].float().cpu().numpy()

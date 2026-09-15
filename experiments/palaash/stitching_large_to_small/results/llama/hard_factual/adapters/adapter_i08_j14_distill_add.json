@@ -1,0 +1,158 @@
+{
+  "pair": "llama",
+  "bank": "hard_factual",
+  "direction": "large->small",
+  "small_layer_i": 8,
+  "large_layer_j": 14,
+  "train_method": "distill",
+  "injection_mode": "add",
+  "llm_tail_unfrozen": false,
+  "dim_in_large": 3072,
+  "dim_out_small": 2048,
+  "depth_matched_i": 8,
+  "form": "h_i = own_i + ((X - mu_x) / sd_x) @ W + b",
+  "injection_point": "input to small decoder block 8",
+  "source_point": "input to large decoder block 14",
+  "ridge_alpha": 0.01,
+  "answer_weight": 4.0,
+  "norm_match": true,
+  "norm_gain": 1.0640627145767212,
+  "n_rows_captured": 89507,
+  "n_rows": 89507,
+  "n_answer_rows": 26851,
+  "n_prompt_rows_kept": 62656,
+  "n_prompt_rows_available": 62656,
+  "answer_weight_frac": 0.6315653298835705,
+  "prompt_row_policy": "auto",
+  "n_prompts": 911,
+  "seed": 0,
+  "capture": {
+    "n_prompts": 911,
+    "n_bank_prompts": 211,
+    "n_corpus_prompts": 700,
+    "fit_corpus": "generic",
+    "vary_templates": true,
+    "n_rows": 89507,
+    "n_answer_rows": 26851,
+    "teacher_answer_tokens": 16,
+    "corpus_answer_tokens": 48,
+    "teacher_logits": true,
+    "teacher_topk": 128
+  },
+  "in_sample": {
+    "r2": -0.010800762935693653,
+    "cosine_mean": 0.03141443803906441,
+    "rel_l2_mean": 0.9999788999557495,
+    "n_rows": 89507
+  },
+  "held_out": {
+    "all": {
+      "r2": 0.9956540553949557,
+      "cosine_mean": 0.9375960826873779,
+      "rel_l2_mean": 0.28545406460762024,
+      "n_rows": 22156
+    },
+    "answer": {
+      "r2": 0.6258266331227553,
+      "cosine_mean": 0.8507590293884277,
+      "rel_l2_mean": 0.5299033522605896,
+      "n_rows": 6382
+    },
+    "prompt": {
+      "r2": 0.9959710460141905,
+      "cosine_mean": 0.9727295637130737,
+      "rel_l2_mean": 0.18655234575271606,
+      "n_rows": 15774
+    },
+    "after_distill": {
+      "all": {
+        "r2": -0.010913700414850513,
+        "cosine_mean": 0.03099787048995495,
+        "rel_l2_mean": 0.999991774559021,
+        "n_rows": 22156
+      },
+      "answer": {
+        "r2": -0.2791678214648652,
+        "cosine_mean": 0.07496520131826401,
+        "rel_l2_mean": 0.9977797269821167,
+        "n_rows": 6382
+      }
+    },
+    "before_distill_same_rows": {
+      "all": {
+        "r2": 0.9955754839968538,
+        "cosine_mean": 0.9498180150985718,
+        "rel_l2_mean": 0.26325345039367676,
+        "n_rows": 22156
+      },
+      "answer": {
+        "r2": 0.7296475151123798,
+        "cosine_mean": 0.8913366794586182,
+        "rel_l2_mean": 0.45360109210014343,
+        "n_rows": 6382
+      }
+    },
+    "after_distill_note": "both maps were fit on these rows; compare the two to each other, not to held_out; injection_mode=add, so these R2 numbers are against the raw delta output, not against Y \u2014 not comparable to replace-mode numbers"
+  },
+  "distill_train_mode": "warm",
+  "distill_epochs": 4,
+  "distill_lr": 2e-06,
+  "distill_tail_lr": null,
+  "distill_batch_seqs": 4,
+  "distill_ce_weight": 0.1,
+  "distill_temperature": 1.0,
+  "distill_topk": 128,
+  "distill_val_frac": 0.2,
+  "distill_n_train_seqs": 729,
+  "distill_n_val_seqs": 182,
+  "distill_val_loss_ridge": 0.5674317308753066,
+  "distill_val_loss_best": 0.378911578129581,
+  "distill_best_epoch": 4,
+  "distill_improved_on_ridge": true,
+  "distill_history": [
+    {
+      "epoch": 0,
+      "val_loss": 0.5674317308753066,
+      "train_loss": null
+    },
+    {
+      "epoch": 1,
+      "val_loss": 0.43604204177515116,
+      "train_loss": 0.4303452509197846
+    },
+    {
+      "epoch": 2,
+      "val_loss": 0.40799223197467616,
+      "train_loss": 0.3362279910204859
+    },
+    {
+      "epoch": 3,
+      "val_loss": 0.3914743535560874,
+      "train_loss": 0.30027713810843865
+    },
+    {
+      "epoch": 4,
+      "val_loss": 0.378911578129581,
+      "train_loss": 0.2749825614221218
+    }
+  ],
+  "distill_max_seqs": null,
+  "frozen_llm_evidence": {
+    "llm_params_total": 146,
+    "llm_params_trainable": 0,
+    "adapter_tensors_trained": 2,
+    "adapter_params_trained": 6293504
+  },
+  "probe_prompt_row0": 283,
+  "probe_logits_sha_head": [
+    -4.21875,
+    -11.6875,
+    -7.34375,
+    -5.625,
+    -6.40625,
+    -6.53125,
+    -10.5,
+    -12.6875
+  ],
+  "probe_logits_argmax": 128006
+}
