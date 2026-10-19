@@ -1,0 +1,20 @@
+Introduction
+
+Large language models get more accurate as they get bigger, but bigger models
+also cost more to run: more memory, higher latency, higher inference cost per
+answer. In practice, teams are often forced to pick one of two bad options: a
+small, cheap model that makes more mistakes, or a large, accurate model that
+is expensive to serve at scale.
+
+The standard fixes both work by changing the small model's weights: train a
+smaller model from scratch, or distill the large model's output behavior into
+the small model through ordinary fine-tuning. Either way, the small model has
+to re-learn everything from training data alone, and the large model itself
+is discarded at answer time.
+
+This project asks a different question: instead of compressing a large
+model's knowledge into a small model's weights ahead of time, can we directly
+reuse a piece of the large model's own internal computation -- its
+intermediate-layer representation of the prompt -- at the moment the small
+model needs it most, and hand that representation to the small model to
+finish the job?

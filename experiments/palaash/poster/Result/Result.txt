@@ -1,0 +1,15 @@
+Result
+(graph: headline_result.png)
+
+- The stitched model reaches 88.7% accuracy on held-out factual QA
+  (n=106) -- vs. 70.8% for the small model alone: a +17.9-point gain.
+- The gain is statistically significant: 95% confidence intervals don't
+  overlap (stitched: 81.2%-93.4%; small model alone: 61.5%-78.6%).
+- Closes to within 9.4 points of the large model's own accuracy (98.1%).
+- On exactly the questions the small model gets wrong but the large model
+  gets right, the stitched model recovers 76.7% of them -- up from 0% for
+  the small model alone.
+- 12.2% lower latency than the large model alone (274 ms vs. 312 ms per
+  answer) -- most of the large model's accuracy, without paying its full
+  inference cost. (Still ~2.2x slower than the small model alone -- the
+  latency win here is against the large model, not the small one.)

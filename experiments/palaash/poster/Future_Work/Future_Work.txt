@@ -1,0 +1,11 @@
+Future Work
+
+Right now this only works within a single model family (e.g., two Llama
+models of different sizes), because it relies on both models sharing a
+tokenizer so their internal representations can be aligned position-by-
+position.
+
+The next step is cross-model stitching: extending this approach to model
+pairs from different families (e.g., a Llama model and a Qwen model), which
+will require a way to align representations across different tokenizers and
+architectures, rather than matching token positions directly.
